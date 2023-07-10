@@ -17,12 +17,12 @@ There are depencies that are required to be installed based on the cloud provide
 ```
 git clone https://github.com/anirudhbiyani/findmytakeover.git
 cd findmytakeover/
-pip3 install -r requirement.txt
+pip3 install -r requirements.txt
 ```
 
 ## Dependencies
 Depending on the cloud provider, you would need permission read data. The following role would work for various cloud provider - 
-  - Amazon Web Services - ViewOnlyRole
+  - Amazon Web Services - ViewOnlyRole and SecurityAudit
   - Microsoft Azure - Reader
   - Google Cloud - Viewer
 
