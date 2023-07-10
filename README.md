@@ -16,7 +16,7 @@ This can become a breeding ground for malicious resources manipulated by an atta
 There are depencies that are required to be installed based on the cloud provider that have been configured. 
 ```
 git clone https://github.com/anirudhbiyani/findmytakeover.git
-cd fimdmytakeover/
+cd findmytakeover/
 pip3 install -r requirement.txt
 pip3 install .
 ```
