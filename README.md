@@ -16,9 +16,8 @@ This can become a breeding ground for malicious resources manipulated by an atta
 There are depencies that are required to be installed based on the cloud provider that have been configured. 
 ```
 git clone https://github.com/anirudhbiyani/findmytakeover.git
-cd fimdmytakeover/
+cd findmytakeover/
 pip3 install -r requirement.txt
-pip3 install .
 ```
 
 ## Dependencies
@@ -94,7 +93,7 @@ infra:
 ```
 
 ## Limtitations 
-This tools cannot guarntee 100% protection against subdomain takeovers. This will not protect you from dangling NS designations at the moment.
+This tools cannot guarantee 100% protection against subdomain takeovers. This will not protect you from dangling NS designations at the moment.
 
 ## Contributing
 
