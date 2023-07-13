@@ -101,9 +101,9 @@ class aws:
                         # Collect AWS Congnito
                         # Collect ELBv2
 
-                        click.echo("Completed collecting Infrastructure details from the account -  " + aws_account + "in the region - " + r)
+                        click.echo("Completed collecting Infrastructure details from the account -  " + str(aws_account) + "in the region - " + r)
                     except KeyError:
                         continue
             else:
-                print(f'Please check the AWS Account number {aws_account}. It does seem to be valid.')
+                print(f'Please check the AWS Account number {str(aws_account)}. It does seem to be valid.')
         return infradata
