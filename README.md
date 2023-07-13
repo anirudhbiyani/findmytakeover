@@ -94,7 +94,9 @@ infra:
 
 ### AWS SSO
 If you use the AWS CLI with AWS SSO, do the following:
+```
 # AWS_PROFILE=<aws profile name> ./findmytakeover.py
+```
 and set the credentials in your configuration to "sso" rather than a role name.
 
 ## Limtitations 
