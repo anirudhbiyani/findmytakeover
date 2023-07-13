@@ -8,11 +8,13 @@ class aws:
         for aws_account in accounts:
             click.echo("Reading DNS data from AWS Account - " + str(aws_account))
             if len(str(aws_account)) == 12:
-                sts_client = boto3.client('sts')
-                assume_role_object = sts_client.assume_role(RoleArn=f'arn:aws:iam::{aws_account}:role/{iamrole}', RoleSessionName='findmytakeover')
-                credentials = assume_role_object['Credentials']
-
-                client = boto3.client('route53', aws_access_key_id=credentials['AccessKeyId'], aws_secret_access_key=credentials['SecretAccessKey'], aws_session_token=credentials['SessionToken'])
+                if iamrole == "sso":
+                    client = boto3.client('route53')
+                else:
+                    sts_client = boto3.client('sts')
+                    assume_role_object = sts_client.assume_role(RoleArn=f'arn:aws:iam::{aws_account}:role/{iamrole}', RoleSessionName='findmytakeover')
+                    credentials = assume_role_object['Credentials']
+                    client = boto3.client('route53', aws_access_key_id=credentials['AccessKeyId'], aws_secret_access_key=credentials['SecretAccessKey'], aws_session_token=credentials['SessionToken'])
                 response = client.list_hosted_zones()['HostedZones']
 
                 for i in response:
@@ -36,11 +38,13 @@ class aws:
             click.echo("Getting Infrastructure details from AWS Account - " + str(aws_account))
             regions = []
             if len(str(aws_account)) == 12: 
-                sts_client = boto3.client('sts')
-                assume_role_object = sts_client.assume_role(RoleArn=f'arn:aws:iam::{aws_account}:role/{iamrole}', RoleSessionName='findmytakeover')
-                credentials = assume_role_object['Credentials']
-
-                ec2_client = boto3.client('ec2', aws_access_key_id=credentials['AccessKeyId'], aws_secret_access_key=credentials['SecretAccessKey'], aws_session_token=credentials['SessionToken'])
+                if iamrole == "sso":
+                    ec2_client = boto3.client('ec2')
+                else:
+                    sts_client = boto3.client('sts')
+                    assume_role_object = sts_client.assume_role(RoleArn=f'arn:aws:iam::{aws_account}:role/{iamrole}', RoleSessionName='findmytakeover')
+                    credentials = assume_role_object['Credentials']
+                    ec2_client = boto3.client('ec2', aws_access_key_id=credentials['AccessKeyId'], aws_secret_access_key=credentials['SecretAccessKey'], aws_session_token=credentials['SessionToken'])
                 response = ec2_client.describe_regions()
                 for i in response['Regions']:
                     regions.append(i['RegionName'])
@@ -48,7 +52,10 @@ class aws:
                 # Collect dynamically assigned IP Address as well and not just IP Address and
                 for r in regions:
                     try:
-                        ec2_client = boto3.client('ec2', aws_access_key_id=credentials['AccessKeyId'], aws_secret_access_key=credentials['SecretAccessKey'], aws_session_token=credentials['SessionToken'], region_name=r)
+                        if iamrole == "sso":
+                            ec2_client = boto3.client('ec2')
+                        else:
+                            ec2_client = boto3.client('ec2', aws_access_key_id=credentials['AccessKeyId'], aws_secret_access_key=credentials['SecretAccessKey'], aws_session_token=credentials['SessionToken'], region_name=r)
                         addresses_dict = ec2_client.describe_instances()
                         for i in addresses_dict['Reservations']:
                             for j in i['Instances']:
@@ -57,29 +64,44 @@ class aws:
                                         infradata.append([aws_account, 'ec2-ip', b['Association']['PublicIp']])
                                         infradata.append([aws_account, 'ec2-ip', b['Association']['PublicDnsName']])
                         
-                        elb_client = boto3.client('elb', aws_access_key_id=credentials['AccessKeyId'], aws_secret_access_key=credentials['SecretAccessKey'], aws_session_token=credentials['SessionToken'], region_name=r)
+                        if iamrole == "sso":
+                             elb_client = boto3.client('elb')
+                        else:
+                            elb_client = boto3.client('elb', aws_access_key_id=credentials['AccessKeyId'], aws_secret_access_key=credentials['SecretAccessKey'], aws_session_token=credentials['SessionToken'], region_name=r)
                         response = elb_client.describe_load_balancers()
                         for i in response['LoadBalancerDescriptions']:
                             if i['Scheme'] == 'internet-facing':
                                 infradata.append([aws_account, 'elb', i['DNSName']])
 
-                        client = boto3.client('cloudfront', aws_access_key_id=credentials['AccessKeyId'], aws_secret_access_key=credentials['SecretAccessKey'], aws_session_token=credentials['SessionToken'], region_name=r)
+                        if iamrole == "sso":
+                            client = boto3.client('cloudfront')
+                        else:
+                            client = boto3.client('cloudfront', aws_access_key_id=credentials['AccessKeyId'], aws_secret_access_key=credentials['SecretAccessKey'], aws_session_token=credentials['SessionToken'], region_name=r)
                         response = client.list_distributions()
                         for i in response['DistributionList']['Items']:
                             infradata.append([aws_account, 'cloudront', i['DomainName']])
 
-                        client = boto3.client('s3', aws_access_key_id=credentials['AccessKeyId'], aws_secret_access_key=credentials['SecretAccessKey'], aws_session_token=credentials['SessionToken'], region_name=r)
+                        if iamrole == "sso":
+                            client = boto3.client('s3')
+                        else:
+                            client = boto3.client('s3', aws_access_key_id=credentials['AccessKeyId'], aws_secret_access_key=credentials['SecretAccessKey'], aws_session_token=credentials['SessionToken'], region_name=r)
                         response = client.list_buckets()
                         for i in response['Buckets']:
                             infradata.append([aws_account, 'cloudront', i['Name']])
 
-                        client = boto3.client('rds', aws_access_key_id=credentials['AccessKeyId'], aws_secret_access_key=credentials['SecretAccessKey'], aws_session_token=credentials['SessionToken'], region_name=r)
+                        if iamrole == "sso":
+                            client = boto3.client('rds')
+                        else:
+                            client = boto3.client('rds', aws_access_key_id=credentials['AccessKeyId'], aws_secret_access_key=credentials['SecretAccessKey'], aws_session_token=credentials['SessionToken'], region_name=r)
                         response = client.describe_db_instances()
                         for i in response['DBInstances']:
                             infradata.append([aws_account, 'rds', i['Endpoint']['Address']])
                         
                         # Collect ES DNS Address
-                        client = boto3.client('opensearch', aws_access_key_id=credentials['AccessKeyId'], aws_secret_access_key=credentials['SecretAccessKey'], aws_session_token=credentials['SessionToken'], region_name=r)
+                        if iamrole == "sso":
+                            client = boto3.client('opensearch')
+                        else:
+                            client = boto3.client('opensearch', aws_access_key_id=credentials['AccessKeyId'], aws_secret_access_key=credentials['SecretAccessKey'], aws_session_token=credentials['SessionToken'], region_name=r)
                         response = client.list_domain_names(EngineType='OpenSearch') #|'Elasticsearch'
                         for i in response['DomainNames']:
                             result = client.describe_domain(DomainName=i['DomainName'])
@@ -91,7 +113,10 @@ class aws:
                             print(result['DomainStatus']['Endpoint'])
 
                         # Collect API Gateway
-                        client = boto3.client('apigatewayv2', aws_access_key_id=credentials['AccessKeyId'], aws_secret_access_key=credentials['SecretAccessKey'], aws_session_token=credentials['SessionToken'], region_name=r)
+                        if iamrole == "sso":
+                            client = boto3.client('apigatewayv2')
+                        else:
+                            client = boto3.client('apigatewayv2', aws_access_key_id=credentials['AccessKeyId'], aws_secret_access_key=credentials['SecretAccessKey'], aws_session_token=credentials['SessionToken'], region_name=r)
                         response = client.get_apis()
                         print(response)
                         

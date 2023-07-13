@@ -92,6 +92,11 @@ infra:
       - subscription3
 ```
 
+### AWS SSO
+If you use the AWS CLI with AWS SSO, do the following:
+# AWS_PROFILE=<aws profile name> ./findmytakeover.py
+and set the credentials in your configuration to "sso" rather than a role name.
+
 ## Limtitations 
 This tools cannot guarantee 100% protection against subdomain takeovers. This will not protect you from dangling NS designations at the moment.
 
