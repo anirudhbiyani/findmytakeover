@@ -146,7 +146,7 @@ def main():
 
     for i in result.index:
         if result['value'][i] == "":
-            click.echo("Found dangling DNS record - " + result["dnskey"][i] + " with the value "+ result["dnsvalue"][i] + " in " + result["csp_x"][i] + " cloud in the account/subscription/project - " + result["account_x"][i])
+            click.echo("Found dangling DNS record - " + str(result["dnskey"][i]) + " with the value "+ str(result["dnsvalue"][i]) + " in " + str(result["csp_x"][i]) + " cloud in the account/subscription/project - " + str(result["account_x"][i]))
     
 if __name__ == "__main__":
     main()
