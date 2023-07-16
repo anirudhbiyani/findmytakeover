@@ -3,7 +3,6 @@ from azure.identity import ClientSecretCredential
 from azure.identity import CertificateCredential
 from azure.mgmt.resource import ResourceManagementClient
 from azure.mgmt.network import NetworkManagementClient
-from azure.mgmt.frontdoor import FrontDoorManagementClient
 from azure.mgmt.cdn import CdnManagementClient
 from azure.mgmt.trafficmanager import TrafficManagerManagementClient
 from azure.mgmt.web import WebSiteManagementClient
@@ -83,10 +82,10 @@ class azure:
                     for u in cdn_client.endpoints.list_by_profile(resource_group_name=r.name, profile_name=c.name):
                         infradata.append([a, "ipaddress", str(u.host_name)])
 
-                    for afd in cdn_client.afd_endpoints.list_by_profile(resource_group_name=r.name, profile_name=i.name):
+                    for afd in cdn_client.afd_endpoints.list_by_profile(resource_group_name=r.name, profile_name=c.name):
                         infradata.append([a, "ipaddress", str(afd.host_name)])
 
-                    for cd in cdn_client.afd_custom_domains.list_by_profile(resource_group_name=r.name, profile_name=i.name):
+                    for cd in cdn_client.afd_custom_domains.list_by_profile(resource_group_name=r.name, profile_name=c.name):
                         infradata.append([a, "ipaddress", str(cd.host_name)])
                         
                 database = database_client.servers.list_by_resource_group(resource_group_name=r.name)
