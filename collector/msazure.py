@@ -13,7 +13,7 @@ from azure.mgmt.search import SearchManagementClient
 from azure.mgmt.containerinstance import ContainerInstanceManagementClient
 from azure.mgmt.containerregistry import ContainerRegistryManagementClient
 from azure.mgmt.redis import RedisManagementClient
-from azure.mgmt.rdbms.mysql import MySQLManagementClient
+from azure.mgmt.sql import SqlManagementClient
 import click
 
 # TODO - Change from ClientSecretCredential to CertificateCredential
@@ -59,37 +59,40 @@ class azure:
             click.echo("Getting Infrastructure details from Microsoft Azure Subscription - " + str(a))
             resourcegroup_client = ResourceManagementClient(credentials, a)
             ip_client = NetworkManagementClient(credentials, a)
-            fd_client = FrontDoorManagementClient(credentials, a)
             cdn_client = CdnManagementClient(credentials, a)
             tm_client = TrafficManagerManagementClient(credentials, a)
             web_client = WebSiteManagementClient(credentials, a)
             storage_client = StorageManagementClient(credentials, a)
             api_client = ApiManagementClient(credentials, a)
-            database_client = MySQLManagementClient(credentials, a)
+            database_client = SqlManagementClient(credentials, a)
             ecr_client = ContainerRegistryManagementClient(credentials, a)
             container_client = ContainerInstanceManagementClient(credentials, a)
             search_client = SearchManagementClient(credentials, a)
             redis_client = RedisManagementClient(credentials, a)
 
             result = resourcegroup_client.resource_groups.list()
-
-            # TODO - Check on why the FrontDoor and Database are not working. 
-            # FrontDoor - This is not working check the SDK or whatever the issues is.
-            fd = fd_client.front_doors.list()
-            for f in fd:
-                infradata.append([a, "ipaddress", f.host_names])
             
             # Azure Functions
             function = web_client.web_apps.list()
             for f in function:
                 infradata.append([a, "ipaddress", f.host_names[0]])
             
-            # Database - This is not working check the SDK or whatever the issues is
-            database = database_client.servers.list()
-            for d in database:
-                infradata.append([a, "ipaddress", d.ip_address])
-            
             for r in result: 
+                cdn = cdn_client.profiles.list_by_resource_group(resource_group_name=r.name)
+                for c in cdn:
+                    for u in cdn_client.endpoints.list_by_profile(resource_group_name=r.name, profile_name=c.name):
+                        infradata.append([a, "ipaddress", str(u.host_name)])
+
+                    for afd in cdn_client.afd_endpoints.list_by_profile(resource_group_name=r.name, profile_name=i.name):
+                        infradata.append([a, "ipaddress", str(afd.host_name)])
+
+                    for cd in cdn_client.afd_custom_domains.list_by_profile(resource_group_name=r.name, profile_name=i.name):
+                        infradata.append([a, "ipaddress", str(cd.host_name)])
+                        
+                database = database_client.servers.list_by_resource_group(resource_group_name=r.name)
+                for d in database:
+                    infradata.append([a, "ipaddress", d.fully_qualified_domain_name])
+
                 ip = ip_client.public_ip_addresses.list(resource_group_name=r.name)
                 for ipaddr in ip:
                     infradata.append([a, "ipaddress", ipaddr.ip_address])
