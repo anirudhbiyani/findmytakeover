@@ -63,6 +63,21 @@ class aws:
                             if i['Scheme'] == 'internet-facing':
                                 infradata.append([aws_account, 'elb', i['DNSName']])
 
+                        elbv2_client = boto3.client('elbv2',aws_access_key_id=credentials['AccessKeyId'], aws_secret_access_key=credentials['SecretAccessKey'], aws_session_token=credentials['SessionToken'], region_name=r)
+                        response = elbv2_client.describe_load_balancers()
+                        for i in response['LoadBalancers']:
+                            if i['Scheme'] == 'internet-facing':
+                                infradata.append([aws_account, 'elbv2', i['DNSName']])
+
+                        beanstalk_client = boto3.client('elasticbeanstalk', aws_access_key_id=credentials['AccessKeyId'], aws_secret_access_key=credentials['SecretAccessKey'], aws_session_token=credentials['SessionToken'], region_name=r)
+                        response = beanstalk_client.describe_applications()
+                        for i in response['Applications']:
+                            result = beanstalk_client.describe_environments(ApplicationName=i['ApplicationName'])
+                            for j in result['Environments']:
+                                infradata.append([aws_account, 'elasticbeanstalk', j['EndpointURL']])
+                                infradata.append([aws_account, 'elasticbeanstalk', j['CNAME']])
+
+
                         client = boto3.client('cloudfront', aws_access_key_id=credentials['AccessKeyId'], aws_secret_access_key=credentials['SecretAccessKey'], aws_session_token=credentials['SessionToken'], region_name=r)
                         response = client.list_distributions()
                         for i in response['DistributionList']['Items']:
@@ -94,12 +109,6 @@ class aws:
                         client = boto3.client('apigatewayv2', aws_access_key_id=credentials['AccessKeyId'], aws_secret_access_key=credentials['SecretAccessKey'], aws_session_token=credentials['SessionToken'], region_name=r)
                         response = client.get_apis()
                         print(response)
-                        
-                        # TODO - Implement colletor for the following services. 
-
-                        # Collect AWS BeanStalk
-                        # Collect AWS Congnito
-                        # Collect ELBv2
 
                         click.echo("Completed collecting Infrastructure details from the account -  " + str(aws_account) + "in the region - " + r)
                     except KeyError:
