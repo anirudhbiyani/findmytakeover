@@ -29,18 +29,27 @@ Depending on the cloud provider, you would need permission read data. The follow
 ## Usage
 ```
 # ./findmytakeover.py --help
-usage: findmytakeover.py [-h] [-c CONFIG_FILE]
+usage: findmytakeover.py [-h] [-c CONFIG_FILE] [-d DUMP_FILE]
 
-optional arguments:
+options:
   -h, --help            show this help message and exit
   -c CONFIG_FILE, --config-file CONFIG_FILE
                         Enter the path to the configuration file that you want the tool to use.
+  -d DUMP_FILE, --dump-file DUMP_FILE
+                        Enter the path to where all the DNS and Infrastructre data would be saved.
 ```
 The default value of the configuiration file would be the same directory where the tool is located and the configuration file would look like this.
 
 
 Thee configuration file looks like this. 
 ```
+exclude:
+  ipaddress:
+    - 100.1.0.0/16
+  domains:
+    - google.com 
+    - example.com
+    
 dns:
   aws:
     enabled: false/true
