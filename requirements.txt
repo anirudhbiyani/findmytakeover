@@ -72,4 +72,4 @@ six==1.16.0
 tabulate==0.9.0
 typing_extensions==4.6.3
 tzdata==2023.3
-urllib3==1.26.16
+urllib3==1.26.19
