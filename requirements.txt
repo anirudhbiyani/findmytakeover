@@ -32,7 +32,7 @@ google-api-core==2.23.0
 google-auth==2.20.0
 google-cloud==0.34.0
 google-cloud-compute==1.11.0
-google-cloud-core==2.3.2
+google-cloud-core==2.4.1
 google-cloud-dns==0.35.0
 google-cloud-functions==1.13.0
 google-cloud-storage==2.9.0
