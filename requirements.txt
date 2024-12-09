@@ -56,7 +56,7 @@ portalocker==3.0.0
 proto-plus==1.25.0
 protobuf==4.23.3
 pyasn1==0.5.0
-pyasn1-modules==0.3.0
+pyasn1-modules==0.4.1
 pycparser==2.21
 PyJWT==2.7.0
 PyMySQL==1.1.1
