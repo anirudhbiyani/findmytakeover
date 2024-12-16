@@ -43,7 +43,7 @@ googleapis-common-protos==1.66.0
 grpc-google-iam-v1==0.13.1
 grpcio==1.54.2
 grpcio-status==1.54.2
-idna==3.7
+idna==3.10
 isodate==0.6.1
 jmespath==1.0.1
 msal==1.22.0
