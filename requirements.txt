@@ -54,7 +54,7 @@ oauthlib==3.2.2
 pandas==2.0.2
 portalocker==3.0.0
 proto-plus==1.25.0
-protobuf==4.23.3
+protobuf==5.29.1
 pyasn1==0.5.0
 pyasn1-modules==0.4.1
 pycparser==2.21
