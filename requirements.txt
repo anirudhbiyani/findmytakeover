@@ -51,7 +51,7 @@ msal-extensions==1.0.0
 msrest==0.7.1
 numpy==1.25.0
 oauthlib==3.2.2
-pandas==2.0.2
+pandas==2.2.3
 portalocker==3.0.0
 proto-plus==1.25.0
 protobuf==5.29.2
