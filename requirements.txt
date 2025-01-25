@@ -57,7 +57,7 @@ proto-plus==1.25.0
 protobuf==5.29.2
 pyasn1==0.5.0
 pyasn1-modules==0.4.1
-pycparser==2.21
+pycparser==2.22
 PyJWT==2.7.0
 PyMySQL==1.1.1
 pyOpenSSL==23.2.0
