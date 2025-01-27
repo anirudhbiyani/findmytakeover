@@ -24,7 +24,7 @@ botocore==1.29.153
 cachetools==5.3.1
 certifi==2024.7.4
 cffi==1.15.1
-charset-normalizer==3.1.0
+charset-normalizer==3.4.1
 click==8.1.7
 cryptography==44.0.0
 docutils==0.20.1
