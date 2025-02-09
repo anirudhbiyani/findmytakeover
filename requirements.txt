@@ -64,7 +64,7 @@ pyOpenSSL==23.2.0
 python-dateutil==2.8.2
 pytz==2023.3
 PyYAML==6.0
-requests==2.32.2
+requests==2.32.3
 requests-oauthlib==2.0.0
 rsa==4.9
 s3transfer==0.6.1
