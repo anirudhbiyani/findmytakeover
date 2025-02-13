@@ -26,7 +26,7 @@ certifi==2024.7.4
 cffi==1.15.1
 charset-normalizer==3.4.1
 click==8.1.8
-cryptography==44.0.0
+cryptography==44.0.1
 docutils==0.20.1
 google-api-core==2.24.0
 google-auth==2.20.0
