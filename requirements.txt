@@ -22,7 +22,7 @@ boto==2.49.0
 boto3==1.26.153
 botocore==1.36.16
 cachetools==5.5.1
-certifi==2024.7.4
+certifi==2025.1.31
 cffi==1.15.1
 charset-normalizer==3.4.1
 click==8.1.8
@@ -40,7 +40,7 @@ google-crc32c==1.5.0
 google-oauth==1.0.1
 google-resumable-media==2.7.2
 googleapis-common-protos==1.66.0
-grpc-google-iam-v1==0.13.1
+grpc-google-iam-v1==0.14.2
 grpcio==1.70.0
 grpcio-status==1.54.2
 idna==3.10
@@ -54,7 +54,7 @@ oauthlib==3.2.2
 pandas==2.2.3
 portalocker==3.0.0
 proto-plus==1.26.0
-protobuf==5.29.2
+protobuf==6.30.1
 pyasn1==0.5.0
 pyasn1-modules==0.4.1
 pycparser==2.22
@@ -67,7 +67,7 @@ PyYAML==6.0
 requests==2.32.3
 requests-oauthlib==2.0.0
 rsa==4.9
-s3transfer==0.6.1
+s3transfer==0.11.4
 six==1.17.0
 tabulate==0.9.0
 typing_extensions==4.12.2
