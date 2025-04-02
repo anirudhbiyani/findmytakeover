@@ -1,6 +1,6 @@
 azure-common==1.1.28
 azure-core==1.27.1
-azure-identity==1.19.0
+azure-identity==1.21.0
 azure-mgmt-apimanagement==4.0.1
 azure-mgmt-cdn==13.1.1
 azure-mgmt-containerinstance==10.1.0
