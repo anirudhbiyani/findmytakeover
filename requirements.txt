@@ -46,7 +46,7 @@ grpcio-status==1.54.2
 idna==3.10
 isodate==0.6.1
 jmespath==1.0.1
-msal==1.22.0
+msal==1.32.0
 msal-extensions==1.2.0
 msrest==0.7.1
 numpy==1.25.0
