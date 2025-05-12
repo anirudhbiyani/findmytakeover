@@ -44,7 +44,7 @@ grpc-google-iam-v1==0.14.2
 grpcio==1.70.0
 grpcio-status==1.68.1
 idna==3.10
-isodate==0.6.1
+isodate==0.7.2
 jmespath==1.0.1
 msal==1.32.0
 msal-extensions==1.2.0
