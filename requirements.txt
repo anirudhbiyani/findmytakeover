@@ -39,7 +39,7 @@ google-cloud-storage==3.0.0
 google-crc32c==1.5.0
 google-oauth==1.0.1
 google-resumable-media==2.7.2
-googleapis-common-protos==1.66.0
+googleapis-common-protos==1.70.0
 grpc-google-iam-v1==0.14.2
 grpcio==1.70.0
 grpcio-status==1.68.1
