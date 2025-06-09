@@ -12,7 +12,7 @@ azure-mgmt-hdinsight==9.0.0
 azure-mgmt-network==23.1.0
 azure-mgmt-rdbms==10.1.0
 azure-mgmt-redis==14.1.0
-azure-mgmt-resource==23.2.0
+azure-mgmt-resource==23.4.0
 azure-mgmt-search==9.1.0
 azure-mgmt-sql==3.0.1
 azure-mgmt-storage==21.0.0
