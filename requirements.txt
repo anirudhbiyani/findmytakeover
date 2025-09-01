@@ -17,7 +17,7 @@ azure-mgmt-search==9.1.0
 azure-mgmt-sql==3.0.1
 azure-mgmt-storage==21.0.0
 azure-mgmt-trafficmanager==1.0.0
-azure-mgmt-web==7.3.1
+azure-mgmt-web==10.0.0
 boto==2.49.0
 boto3==1.26.153
 botocore==1.38.41
