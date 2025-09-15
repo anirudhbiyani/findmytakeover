@@ -42,7 +42,7 @@ google-resumable-media==2.7.2
 googleapis-common-protos==1.70.0
 grpc-google-iam-v1==0.14.2
 grpcio==1.70.0
-grpcio-status==1.68.1
+grpcio-status==1.74.0
 idna==3.10
 isodate==0.7.2
 jmespath==1.0.1
