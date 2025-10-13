@@ -27,7 +27,7 @@ cffi==2.0.0
 charset-normalizer==3.4.3
 click==8.1.8
 cryptography==46.0.1
-docutils==0.21.2
+docutils==0.22.2
 google-api-core==2.25.2
 google-auth==2.40.3
 google-cloud==0.34.0
