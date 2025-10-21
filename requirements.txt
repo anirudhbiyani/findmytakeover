@@ -31,7 +31,7 @@ docutils==0.21.2
 google-api-core==2.25.2
 google-auth==2.40.3
 google-cloud==0.34.0
-google-cloud-compute==1.31.0
+google-cloud-compute==1.40.0
 google-cloud-core==2.4.1
 google-cloud-dns==0.35.0
 google-cloud-functions==1.19.0
