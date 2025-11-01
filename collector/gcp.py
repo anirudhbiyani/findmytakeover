@@ -50,7 +50,7 @@ class gcp:
             for zone, response in frontend:
                if response.forwarding_rules:
                    for i in response.forwarding_rules:
-                       infradata.append([proj, "loadbalancer", i.I_p_address])
+                       infradata.append([proj, "loadbalancer", i.IP_address])
         
         # Cloud Functions
             function_client = functions_v2.FunctionServiceClient(credentials=credentials)
