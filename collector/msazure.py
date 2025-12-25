@@ -1,6 +1,7 @@
+#!/usr/bin/env python3
+
 from azure.mgmt.dns import DnsManagementClient
 from azure.identity import ClientSecretCredential
-from azure.identity import CertificateCredential
 from azure.mgmt.resource import ResourceManagementClient
 from azure.mgmt.network import NetworkManagementClient
 from azure.mgmt.cdn import CdnManagementClient
@@ -15,144 +16,252 @@ from azure.mgmt.redis import RedisManagementClient
 from azure.mgmt.sql import SqlManagementClient
 import click
 
-# TODO - Change from ClientSecretCredential to CertificateCredential
+
+def _strip_protocol(url):
+    """Remove https:// prefix and trailing slash from URL."""
+    if not url:
+        return ""
+    return url.removeprefix("https://").removeprefix("http://").rstrip("/")
+
 
 class azure:
-    def dns(account, cred):
+    @staticmethod
+    def dns(accounts, cred):
+        """Collect DNS records from Azure subscriptions."""
+        credentials = ClientSecretCredential(
+            cred["AZURE_TENANT_ID"],
+            cred["AZURE_CLIENT_ID"],
+            cred["AZURE_CLIENT_SECRET"],
+        )
         dnsdata = []
-        credentials = ClientSecretCredential(cred["AZURE_TENANT_ID"], cred["AZURE_CLIENT_ID"], cred["AZURE_CLIENT_SECRET"])
-        for a in account:
-            click.echo("Reading DNS data from Azure Subscription - " + str(a))
-            resourcegroup_client = ResourceManagementClient(credentials, a)
-            dns_client = DnsManagementClient(credentials, a)
-            result = resourcegroup_client.resource_groups.list()
-            for r in result:            
-                zone = dns_client.zones.list_by_resource_group(resource_group_name=r.name)
-                for z in zone:
-                    result = dns_client.record_sets.list_by_dns_zone(resource_group_name=r.name, zone_name=z.name)
-                    for i in result:
-                        if i.a_records != None:
-                            for j in i.a_records:
-                                dnsdata.append([a, i.fqdn[:-1], j.ipv4_address])
-                        elif i.aaaa_records != None:
-                            for j in i.aaaa_records:
-                                dnsdata.append([a, i.fqdn[:-1], j.ipv6_address])
-                        elif i.cname_record != None:
-                            dnsdata.append([a, i.fqdn[:-1], i.cname_record.cname])
-                       # TODO - Implement ALIAS Records
-                       # elif i.target_resource.id != None:
-                        #    dnsdata.append([a, i.fqdn[:-1], i.target_resource])
-                            # Traffic Manager
-                            # Public IP Address
-                            # Azure CDN
-                            # Front Door
-                            # Static Web Page
-                        else:
-                            continue
+
+        for subscription in accounts:
+            click.echo(f"Reading DNS data from Azure Subscription - {subscription}")
+
+            resourcegroup_client = ResourceManagementClient(credentials, subscription)
+            dns_client = DnsManagementClient(credentials, subscription)
+
+            for rg in resourcegroup_client.resource_groups.list():
+                for zone in dns_client.zones.list_by_resource_group(
+                    resource_group_name=rg.name
+                ):
+                    record_sets = dns_client.record_sets.list_by_dns_zone(
+                        resource_group_name=rg.name, zone_name=zone.name
+                    )
+
+                    for record in record_sets:
+                        fqdn = record.fqdn.rstrip(".")
+
+                        if record.a_records:
+                            dnsdata.extend(
+                                [subscription, fqdn, r.ipv4_address]
+                                for r in record.a_records
+                            )
+                        elif record.aaaa_records:
+                            dnsdata.extend(
+                                [subscription, fqdn, r.ipv6_address]
+                                for r in record.aaaa_records
+                            )
+                        elif record.cname_record:
+                            dnsdata.append(
+                                [subscription, fqdn, record.cname_record.cname]
+                            )
+                        # TODO: Implement ALIAS Records (Traffic Manager, Public IP, Azure CDN, Front Door, Static Web)
+
         return dnsdata
-    
-    def infra(account, cred):
+
+    @staticmethod
+    def infra(accounts, cred):
+        """Collect infrastructure data from Azure subscriptions."""
+        credentials = ClientSecretCredential(
+            cred["AZURE_TENANT_ID"],
+            cred["AZURE_CLIENT_ID"],
+            cred["AZURE_CLIENT_SECRET"],
+        )
         infradata = []
-        credentials = ClientSecretCredential(cred["AZURE_TENANT_ID"], cred["AZURE_CLIENT_ID"], cred["AZURE_CLIENT_SECRET"])
-        for a in account:
-            click.echo("Getting Infrastructure details from Microsoft Azure Subscription - " + str(a))
-            resourcegroup_client = ResourceManagementClient(credentials, a)
-            ip_client = NetworkManagementClient(credentials, a)
-            cdn_client = CdnManagementClient(credentials, a)
-            tm_client = TrafficManagerManagementClient(credentials, a)
-            web_client = WebSiteManagementClient(credentials, a)
-            storage_client = StorageManagementClient(credentials, a)
-            api_client = ApiManagementClient(credentials, a)
-            database_client = SqlManagementClient(credentials, a)
-            ecr_client = ContainerRegistryManagementClient(credentials, a)
-            container_client = ContainerInstanceManagementClient(credentials, a)
-            search_client = SearchManagementClient(credentials, a)
-            redis_client = RedisManagementClient(credentials, a)
 
-            result = resourcegroup_client.resource_groups.list()
-            
-            # Azure Functions
-            function = web_client.web_apps.list()
-            for f in function:
-                infradata.append([a, "ipaddress", f.host_names[0]])
-            
-            for r in result: 
-                cdn = cdn_client.profiles.list_by_resource_group(resource_group_name=r.name)
-                for c in cdn:
-                    for u in cdn_client.endpoints.list_by_profile(resource_group_name=r.name, profile_name=c.name):
-                        infradata.append([a, "ipaddress", str(u.host_name)])
+        for subscription in accounts:
+            click.echo(
+                f"Getting Infrastructure details from Microsoft Azure Subscription - {subscription}"
+            )
 
-                    for afd in cdn_client.afd_endpoints.list_by_profile(resource_group_name=r.name, profile_name=c.name):
-                        infradata.append([a, "ipaddress", str(afd.host_name)])
+            # Initialize all clients once per subscription
+            clients = _create_azure_clients(credentials, subscription)
 
-                    for cd in cdn_client.afd_custom_domains.list_by_profile(resource_group_name=r.name, profile_name=c.name):
-                        infradata.append([a, "ipaddress", str(cd.host_name)])
-                        
-                database = database_client.servers.list_by_resource_group(resource_group_name=r.name)
-                for d in database:
-                    infradata.append([a, "ipaddress", d.fully_qualified_domain_name])
+            # Azure Functions / Web Apps (subscription-wide, no need to iterate per RG)
+            for app in clients["web"].web_apps.list():
+                if app.host_names:
+                    infradata.append([subscription, "webapp", app.host_names[0]])
 
-                ip = ip_client.public_ip_addresses.list(resource_group_name=r.name)
-                for ipaddr in ip:
-                    infradata.append([a, "ipaddress", ipaddr.ip_address])
-                
-                cdn = cdn_client.profiles.list()
-                for c in cdn:
-                    for u in cdn_client.endpoints.list_by_profile(resource_group_name=r.name, profile_name=c.name):
-                        infradata.append([a, "ipaddress", str(u.host_name)])
-                    
-                tm = tm_client.profiles.list_by_resource_group(resource_group_name=r.name)
-                for t in tm:
-                    infradata.append([a, "ipaddress", str(t.dns_config.fqdn)])
-                
-                web = web_client.static_sites.list()
-                for w in web:
-                    infradata.append([a, "ipaddress", str(w.default_hostname)])
-                    
-                storage = storage_client.storage_accounts.list_by_resource_group(resource_group_name=r.name)
-                for container in storage:
-                    infradata.append([a, "ipaddress", str(container.primary_endpoints.blob)[8:-1]])
-                    infradata.append([a, "ipaddress", str(container.primary_endpoints.queue)[8:-1]])
-                    infradata.append([a, "ipaddress", str(container.primary_endpoints.table)[8:-1]])
-                    infradata.append([a, "ipaddress", str(container.primary_endpoints.file)[8:-1]])
-                    infradata.append([a, "ipaddress", str(container.primary_endpoints.web)[8:-1]])
-                    infradata.append([a, "ipaddress", str(container.primary_endpoints.dfs)[8:-1]])
-                    infradata.append([a, "ipaddress", str(container.secondary_endpoints.blob)[8:-1]])
-                    infradata.append([a, "ipaddress", str(container.secondary_endpoints.queue)[8:-1]])
-                    infradata.append([a, "ipaddress", str(container.secondary_endpoints.table)[8:-1]])
-                    infradata.append([a, "ipaddress", str(container.secondary_endpoints.file)[8:-1]])
-                    infradata.append([a, "ipaddress", str(container.secondary_endpoints.web)[8:-1]])
-                    infradata.append([a, "ipaddress", str(container.secondary_endpoints.dfs)[8:-1]])
-                
-                # Azure API
-                api = api_client.api_management_service.list_by_resource_group(resource_group_name=r.name)
-                for aa in api:
-                    infradata.append([a, "ipaddress", str(aa.gateway_url[8:])])
-                    infradata.append([a, "ipaddress", str(aa.public_ip_addresses)])
-                
-                # Azure ECR
-                ecr = ecr_client.registries.list_by_resource_group(resource_group_name=r.name)
-                for e in ecr:
-                    infradata.append([a, "ipaddress", str(e.login_server)])
-                
-                # Azure Container Instance
-                container = container_client.container_groups.list_by_resource_group(resource_group_name=r.name)
-                for c in container:
-                    infradata.append([a, "ipaddress", str(c.ip_address.ip)])
-                
-                # Azure Cognitive Search
-                search = search_client.services.list_by_resource_group(resource_group_name=r.name)
-                for s in search:
-                    infradata.append([a, "ipaddress", str(s.name) + ".search.windows.net"])
-                
-                # Azure Redis
-                redis = redis_client.redis.list_by_resource_group(resource_group_name=r.name)
-                for r in redis:
-                    infradata.append([a, "ipaddress", str(r.host_name)])
-                
-                # Azure Functions
-                function = web_client.web_apps.list()
-                for f in function:
-                    infradata.append([a, "ipaddress", str(f.host_names[0])])
+            # Static Sites (subscription-wide)
+            for site in clients["web"].static_sites.list():
+                if site.default_hostname:
+                    infradata.append(
+                        [subscription, "staticsite", site.default_hostname]
+                    )
+
+            # Process resource groups
+            for rg in clients["resource"].resource_groups.list():
+                rg_name = rg.name
+
+                # CDN Profiles and Endpoints
+                _collect_cdn_data(clients["cdn"], subscription, rg_name, infradata)
+
+                # SQL Databases
+                for server in clients["sql"].servers.list_by_resource_group(
+                    resource_group_name=rg_name
+                ):
+                    if server.fully_qualified_domain_name:
+                        infradata.append(
+                            [subscription, "sql", server.fully_qualified_domain_name]
+                        )
+
+                # Public IP Addresses
+                for ip in clients["network"].public_ip_addresses.list(
+                    resource_group_name=rg_name
+                ):
+                    if ip.ip_address:
+                        infradata.append([subscription, "publicip", ip.ip_address])
+
+                # Traffic Manager Profiles
+                for profile in clients["traffic"].profiles.list_by_resource_group(
+                    resource_group_name=rg_name
+                ):
+                    if profile.dns_config and profile.dns_config.fqdn:
+                        infradata.append(
+                            [subscription, "trafficmanager", profile.dns_config.fqdn]
+                        )
+
+                # Storage Accounts
+                _collect_storage_data(
+                    clients["storage"], subscription, rg_name, infradata
+                )
+
+                # API Management
+                for api in clients["api"].api_management_service.list_by_resource_group(
+                    resource_group_name=rg_name
+                ):
+                    if api.gateway_url:
+                        infradata.append(
+                            [
+                                subscription,
+                                "apimanagement",
+                                _strip_protocol(api.gateway_url),
+                            ]
+                        )
+                    if api.public_ip_addresses:
+                        for ip in api.public_ip_addresses:
+                            infradata.append([subscription, "apimanagement", ip])
+
+                # Container Registry
+                for registry in clients["ecr"].registries.list_by_resource_group(
+                    resource_group_name=rg_name
+                ):
+                    if registry.login_server:
+                        infradata.append(
+                            [subscription, "containerregistry", registry.login_server]
+                        )
+
+                # Container Instances
+                for container in clients[
+                    "container"
+                ].container_groups.list_by_resource_group(resource_group_name=rg_name):
+                    if container.ip_address and container.ip_address.ip:
+                        infradata.append(
+                            [subscription, "containerinstance", container.ip_address.ip]
+                        )
+
+                # Cognitive Search
+                for search in clients["search"].services.list_by_resource_group(
+                    resource_group_name=rg_name
+                ):
+                    if search.name:
+                        infradata.append(
+                            [
+                                subscription,
+                                "cognitivesearch",
+                                f"{search.name}.search.windows.net",
+                            ]
+                        )
+
+                # Redis Cache
+                for cache in clients["redis"].redis.list_by_resource_group(
+                    resource_group_name=rg_name
+                ):
+                    if cache.host_name:
+                        infradata.append([subscription, "redis", cache.host_name])
 
         return infradata
+
+
+def _create_azure_clients(credentials, subscription):
+    """Create all Azure management clients for a subscription."""
+    return {
+        "resource": ResourceManagementClient(credentials, subscription),
+        "network": NetworkManagementClient(credentials, subscription),
+        "cdn": CdnManagementClient(credentials, subscription),
+        "traffic": TrafficManagerManagementClient(credentials, subscription),
+        "web": WebSiteManagementClient(credentials, subscription),
+        "storage": StorageManagementClient(credentials, subscription),
+        "api": ApiManagementClient(credentials, subscription),
+        "sql": SqlManagementClient(credentials, subscription),
+        "ecr": ContainerRegistryManagementClient(credentials, subscription),
+        "container": ContainerInstanceManagementClient(credentials, subscription),
+        "search": SearchManagementClient(credentials, subscription),
+        "redis": RedisManagementClient(credentials, subscription),
+    }
+
+
+def _collect_cdn_data(cdn_client, subscription, rg_name, infradata):
+    """Collect CDN endpoints and AFD data from a resource group."""
+    for profile in cdn_client.profiles.list_by_resource_group(
+        resource_group_name=rg_name
+    ):
+        profile_name = profile.name
+
+        # Standard CDN endpoints
+        for endpoint in cdn_client.endpoints.list_by_profile(
+            resource_group_name=rg_name, profile_name=profile_name
+        ):
+            if endpoint.host_name:
+                infradata.append([subscription, "cdn", endpoint.host_name])
+
+        # Azure Front Door endpoints
+        for afd in cdn_client.afd_endpoints.list_by_profile(
+            resource_group_name=rg_name, profile_name=profile_name
+        ):
+            if afd.host_name:
+                infradata.append([subscription, "frontdoor", afd.host_name])
+
+        # AFD Custom Domains
+        for domain in cdn_client.afd_custom_domains.list_by_profile(
+            resource_group_name=rg_name, profile_name=profile_name
+        ):
+            if domain.host_name:
+                infradata.append([subscription, "frontdoor", domain.host_name])
+
+
+def _collect_storage_data(storage_client, subscription, rg_name, infradata):
+    """Collect storage account endpoints from a resource group."""
+    endpoint_types = ("blob", "queue", "table", "file", "web", "dfs")
+
+    for account in storage_client.storage_accounts.list_by_resource_group(
+        resource_group_name=rg_name
+    ):
+        # Primary endpoints
+        if account.primary_endpoints:
+            for ep_type in endpoint_types:
+                endpoint = getattr(account.primary_endpoints, ep_type, None)
+                if endpoint:
+                    infradata.append(
+                        [subscription, "storage", _strip_protocol(endpoint)]
+                    )
+
+        # Secondary endpoints (if geo-redundant)
+        if account.secondary_endpoints:
+            for ep_type in endpoint_types:
+                endpoint = getattr(account.secondary_endpoints, ep_type, None)
+                if endpoint:
+                    infradata.append(
+                        [subscription, "storage", _strip_protocol(endpoint)]
+                    )

@@ -1,237 +1,203 @@
+#!/usr/bin/env python3
+
 import boto3
 import click
 
+# Record types we're interested in
+_RELEVANT_RECORD_TYPES = frozenset(("A", "AAAA", "CNAME"))
 
-# get data from all regions
+
 class aws:
+    @staticmethod
     def dns(accounts, iamrole):
+        """Collect DNS records from AWS accounts via Route53."""
         dnsdata = []
+
         for aws_account in accounts:
-            click.echo("Reading DNS data from AWS Account - " + str(aws_account))
-            if len(str(aws_account)) == 12:
-                sts_client = boto3.client("sts")
-                assume_role_object = sts_client.assume_role(
-                    RoleArn=f"arn:aws:iam::{aws_account}:role/{iamrole}",
-                    RoleSessionName="findmytakeover",
-                )
-                credentials = assume_role_object["Credentials"]
+            account_str = str(aws_account)
 
-                client = boto3.client(
-                    "route53",
-                    aws_access_key_id=credentials["AccessKeyId"],
-                    aws_secret_access_key=credentials["SecretAccessKey"],
-                    aws_session_token=credentials["SessionToken"],
-                )
-                response = client.list_hosted_zones()["HostedZones"]
-
-                for i in response:
-                    if i["Config"]["PrivateZone"] is False:
-                        record = client.list_resource_record_sets(HostedZoneId=i["Id"])[
-                            "ResourceRecordSets"
-                        ]
-                        for j in record:
-                            if (
-                                j["Type"] == "A"
-                                or j["Type"] == "AAAA"
-                                or j["Type"] == "CNAME"
-                            ):
-                                if j.get("ResourceRecords") is not None:
-                                    for k in j.get("ResourceRecords"):
-                                        dnsdata.append(
-                                            [aws_account, j["Name"], k["Value"]]
-                                        )
-
-                                if j.get("AliasTarget") is not None:
-                                    dnsdata.append(
-                                        [
-                                            aws_account,
-                                            j["Name"],
-                                            j.get("AliasTarget")["DNSName"],
-                                        ]
-                                    )
-            else:
+            if len(account_str) != 12:
                 click.echo(
-                    f"Please check the AWS Account number {aws_account}. It does seem to be valid."
+                    f"Please check the AWS Account number {aws_account}. It does not seem to be valid."
                 )
+                continue
+
+            click.echo(f"Reading DNS data from AWS Account - {account_str}")
+
+            credentials = _assume_role(aws_account, iamrole)
+            client = _create_client("route53", credentials)
+
+            hosted_zones = client.list_hosted_zones()["HostedZones"]
+
+            for zone in hosted_zones:
+                # Skip private zones
+                if zone["Config"]["PrivateZone"]:
+                    continue
+
+                records = client.list_resource_record_sets(HostedZoneId=zone["Id"])[
+                    "ResourceRecordSets"
+                ]
+
+                for record in records:
+                    if record["Type"] not in _RELEVANT_RECORD_TYPES:
+                        continue
+
+                    record_name = record["Name"]
+
+                    # Handle standard resource records
+                    resource_records = record.get("ResourceRecords")
+                    if resource_records:
+                        dnsdata.extend(
+                            [aws_account, record_name, rr["Value"]]
+                            for rr in resource_records
+                        )
+
+                    # Handle alias records
+                    alias_target = record.get("AliasTarget")
+                    if alias_target:
+                        dnsdata.append(
+                            [aws_account, record_name, alias_target["DNSName"]]
+                        )
+
         return dnsdata
 
+    @staticmethod
     def infra(accounts, iamrole):
+        """Collect infrastructure data from AWS accounts."""
         infradata = []
+
         for aws_account in accounts:
+            account_str = str(aws_account)
+
+            if len(account_str) != 12:
+                click.echo(
+                    f"Please check the AWS Account number {aws_account}. It does not seem to be valid."
+                )
+                continue
+
             click.echo(
-                "Getting Infrastructure details from AWS Account - " + str(aws_account)
+                f"Getting Infrastructure details from AWS Account - {account_str}"
             )
-            regions = []
-            if len(str(aws_account)) == 12:
-                sts_client = boto3.client("sts")
-                assume_role_object = sts_client.assume_role(
-                    RoleArn=f"arn:aws:iam::{aws_account}:role/{iamrole}",
-                    RoleSessionName="findmytakeover",
-                )
-                credentials = assume_role_object["Credentials"]
 
-                ec2_client = boto3.client(
-                    "ec2",
-                    aws_access_key_id=credentials["AccessKeyId"],
-                    aws_secret_access_key=credentials["SecretAccessKey"],
-                    aws_session_token=credentials["SessionToken"],
-                )
-                response = ec2_client.describe_regions()
-                for i in response["Regions"]:
-                    regions.append(i["RegionName"])
+            credentials = _assume_role(aws_account, iamrole)
 
-                # Collect dynamically assigned IP Address as well and not just IP Address and
-                for r in regions:
-                    try:
-                        ec2_client = boto3.client(
-                            "ec2",
-                            aws_access_key_id=credentials["AccessKeyId"],
-                            aws_secret_access_key=credentials["SecretAccessKey"],
-                            aws_session_token=credentials["SessionToken"],
-                            region_name=r,
-                        )
-                        addresses_dict = ec2_client.describe_instances()
-                        for i in addresses_dict["Reservations"]:
-                            for j in i["Instances"]:
-                                for b in j["NetworkInterfaces"]:
-                                    if "Association" in b:
-                                        infradata.append(
-                                            [
-                                                aws_account,
-                                                "ec2-ip",
-                                                b["Association"]["PublicIp"],
-                                            ]
-                                        )
-                                        infradata.append(
-                                            [
-                                                aws_account,
-                                                "ec2-ip",
-                                                b["Association"]["PublicDnsName"],
-                                            ]
-                                        )
+            # Get all enabled regions
+            ec2_client = _create_client("ec2", credentials)
+            regions = [
+                r["RegionName"] for r in ec2_client.describe_regions()["Regions"]
+            ]
 
-                        elb_client = boto3.client(
-                            "elb",
-                            aws_access_key_id=credentials["AccessKeyId"],
-                            aws_secret_access_key=credentials["SecretAccessKey"],
-                            aws_session_token=credentials["SessionToken"],
-                            region_name=r,
-                        )
-                        response = elb_client.describe_load_balancers()
-                        for i in response["LoadBalancerDescriptions"]:
-                            if i["Scheme"] == "internet-facing":
-                                infradata.append([aws_account, "elb", i["DNSName"]])
+            for region in regions:
+                try:
+                    _collect_region_infra(aws_account, credentials, region, infradata)
+                    click.echo(
+                        f"Completed collecting Infrastructure details from account {account_str} in region {region}"
+                    )
+                except KeyError:
+                    continue
 
-                        elbv2_client = boto3.client(
-                            "elbv2",
-                            aws_access_key_id=credentials["AccessKeyId"],
-                            aws_secret_access_key=credentials["SecretAccessKey"],
-                            aws_session_token=credentials["SessionToken"],
-                            region_name=r,
-                        )
-                        response = elbv2_client.describe_load_balancers()
-                        for i in response["LoadBalancers"]:
-                            if i["Scheme"] == "internet-facing":
-                                infradata.append([aws_account, "elbv2", i["DNSName"]])
-
-                        beanstalk_client = boto3.client(
-                            "elasticbeanstalk",
-                            aws_access_key_id=credentials["AccessKeyId"],
-                            aws_secret_access_key=credentials["SecretAccessKey"],
-                            aws_session_token=credentials["SessionToken"],
-                            region_name=r,
-                        )
-                        response = beanstalk_client.describe_applications()
-                        for i in response["Applications"]:
-                            result = beanstalk_client.describe_environments(
-                                ApplicationName=i["ApplicationName"]
-                            )
-                            for j in result["Environments"]:
-                                infradata.append(
-                                    [aws_account, "elasticbeanstalk", j["EndpointURL"]]
-                                )
-                                infradata.append(
-                                    [aws_account, "elasticbeanstalk", j["CNAME"]]
-                                )
-
-                        client = boto3.client(
-                            "cloudfront",
-                            aws_access_key_id=credentials["AccessKeyId"],
-                            aws_secret_access_key=credentials["SecretAccessKey"],
-                            aws_session_token=credentials["SessionToken"],
-                            region_name=r,
-                        )
-                        response = client.list_distributions()
-                        for i in response["DistributionList"]["Items"]:
-                            infradata.append(
-                                [aws_account, "cloudfront", i["DomainName"]]
-                            )
-
-                        client = boto3.client(
-                            "s3",
-                            aws_access_key_id=credentials["AccessKeyId"],
-                            aws_secret_access_key=credentials["SecretAccessKey"],
-                            aws_session_token=credentials["SessionToken"],
-                            region_name=r,
-                        )
-                        response = client.list_buckets()
-                        for i in response["Buckets"]:
-                            infradata.append([aws_account, "cloudfront", i["Name"]])
-
-                        client = boto3.client(
-                            "rds",
-                            aws_access_key_id=credentials["AccessKeyId"],
-                            aws_secret_access_key=credentials["SecretAccessKey"],
-                            aws_session_token=credentials["SessionToken"],
-                            region_name=r,
-                        )
-                        response = client.describe_db_instances()
-                        for i in response["DBInstances"]:
-                            infradata.append(
-                                [aws_account, "rds", i["Endpoint"]["Address"]]
-                            )
-
-                        # Collect ES DNS Address
-                        client = boto3.client(
-                            "opensearch",
-                            aws_access_key_id=credentials["AccessKeyId"],
-                            aws_secret_access_key=credentials["SecretAccessKey"],
-                            aws_session_token=credentials["SessionToken"],
-                            region_name=r,
-                        )
-                        response = client.list_domain_names(
-                            EngineType="OpenSearch"
-                        )  # |'Elasticsearch'
-                        for i in response["DomainNames"]:
-                            result = client.describe_domain(DomainName=i["DomainName"])
-                            print(result["DomainStatus"]["Endpoint"])
-
-                        response = client.list_domain_names(EngineType="Elasticsearch")
-                        for i in response["DomainNames"]:
-                            result = client.describe_domain(DomainName=i["DomainName"])
-                            print(result["DomainStatus"]["Endpoint"])
-
-                        # Collect API Gateway
-                        client = boto3.client(
-                            "apigatewayv2",
-                            aws_access_key_id=credentials["AccessKeyId"],
-                            aws_secret_access_key=credentials["SecretAccessKey"],
-                            aws_session_token=credentials["SessionToken"],
-                            region_name=r,
-                        )
-                        response = client.get_apis()
-                        print(response)
-
-                        click.echo(
-                            "Completed collecting Infrastructure details from the account -  "
-                            + str(aws_account)
-                            + "in the region - "
-                            + r
-                        )
-                    except KeyError:
-                        continue
-            else:
-                print(
-                    f"Please check the AWS Account number {str(aws_account)}. It does seem to be valid."
-                )
         return infradata
+
+
+def _assume_role(aws_account, iamrole):
+    """Assume IAM role and return temporary credentials."""
+    sts_client = boto3.client("sts")
+    assume_role_response = sts_client.assume_role(
+        RoleArn=f"arn:aws:iam::{aws_account}:role/{iamrole}",
+        RoleSessionName="findmytakeover",
+    )
+    return assume_role_response["Credentials"]
+
+
+def _create_client(service, credentials, region=None):
+    """Create a boto3 client with the given credentials."""
+    kwargs = {
+        "aws_access_key_id": credentials["AccessKeyId"],
+        "aws_secret_access_key": credentials["SecretAccessKey"],
+        "aws_session_token": credentials["SessionToken"],
+    }
+    if region:
+        kwargs["region_name"] = region
+    return boto3.client(service, **kwargs)
+
+
+def _collect_region_infra(aws_account, credentials, region, infradata):
+    """Collect infrastructure data from a specific region."""
+
+    # EC2 Instances
+    ec2_client = _create_client("ec2", credentials, region)
+    reservations = ec2_client.describe_instances()["Reservations"]
+    for reservation in reservations:
+        for instance in reservation["Instances"]:
+            for network_interface in instance["NetworkInterfaces"]:
+                association = network_interface.get("Association")
+                if association:
+                    infradata.append([aws_account, "ec2-ip", association["PublicIp"]])
+                    infradata.append(
+                        [aws_account, "ec2-ip", association["PublicDnsName"]]
+                    )
+
+    # Classic Load Balancers
+    elb_client = _create_client("elb", credentials, region)
+    for lb in elb_client.describe_load_balancers()["LoadBalancerDescriptions"]:
+        if lb["Scheme"] == "internet-facing":
+            infradata.append([aws_account, "elb", lb["DNSName"]])
+
+    # Application/Network Load Balancers
+    elbv2_client = _create_client("elbv2", credentials, region)
+    for lb in elbv2_client.describe_load_balancers()["LoadBalancers"]:
+        if lb["Scheme"] == "internet-facing":
+            infradata.append([aws_account, "elbv2", lb["DNSName"]])
+
+    # Elastic Beanstalk
+    beanstalk_client = _create_client("elasticbeanstalk", credentials, region)
+    for app in beanstalk_client.describe_applications()["Applications"]:
+        environments = beanstalk_client.describe_environments(
+            ApplicationName=app["ApplicationName"]
+        )["Environments"]
+        for env in environments:
+            infradata.append([aws_account, "elasticbeanstalk", env["EndpointURL"]])
+            infradata.append([aws_account, "elasticbeanstalk", env["CNAME"]])
+
+    # CloudFront Distributions
+    cloudfront_client = _create_client("cloudfront", credentials, region)
+    distributions = cloudfront_client.list_distributions()
+    dist_list = distributions.get("DistributionList", {})
+    if dist_list and "Items" in dist_list:
+        for dist in dist_list["Items"]:
+            infradata.append([aws_account, "cloudfront", dist["DomainName"]])
+
+    # S3 Buckets
+    s3_client = _create_client("s3", credentials, region)
+    for bucket in s3_client.list_buckets()["Buckets"]:
+        infradata.append([aws_account, "s3", bucket["Name"]])
+
+    # RDS Instances
+    rds_client = _create_client("rds", credentials, region)
+    for db in rds_client.describe_db_instances()["DBInstances"]:
+        endpoint = db.get("Endpoint")
+        if endpoint:
+            infradata.append([aws_account, "rds", endpoint["Address"]])
+
+    # OpenSearch/Elasticsearch Domains
+    opensearch_client = _create_client("opensearch", credentials, region)
+
+    for engine_type in ("OpenSearch", "Elasticsearch"):
+        domains = opensearch_client.list_domain_names(EngineType=engine_type)[
+            "DomainNames"
+        ]
+        for domain in domains:
+            domain_info = opensearch_client.describe_domain(
+                DomainName=domain["DomainName"]
+            )
+            endpoint = domain_info["DomainStatus"].get("Endpoint")
+            if endpoint:
+                infradata.append([aws_account, "opensearch", endpoint])
+
+    # API Gateway
+    apigateway_client = _create_client("apigatewayv2", credentials, region)
+    apis = apigateway_client.get_apis()
+    for api in apis.get("Items", []):
+        api_endpoint = api.get("ApiEndpoint")
+        if api_endpoint:
+            infradata.append([aws_account, "apigateway", api_endpoint])
