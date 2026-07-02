@@ -101,6 +101,9 @@ infra:
       - subscription3
 ```
 
+## Claude skill
+A [Claude Code](https://docs.claude.com/en/docs/claude-code) skill is bundled under [`skills/dangling-dns-finder`](skills/dangling-dns-finder). It lets you run a dangling-DNS / subdomain-takeover audit conversationally ("find dangling domains in `example.com`") against a Route53 zone, with NXDOMAIN checks verified across multiple resolvers, cloud-inventory cross-referencing, HTTP liveness confirmation, and a ready-to-review Route53 delete batch. See its [SKILL.md](skills/dangling-dns-finder/SKILL.md) for usage.
+
 ## Limtitations 
 This tools cannot guarantee 100% protection against subdomain takeovers. This will not protect you from dangling NS designations at the moment.
 
