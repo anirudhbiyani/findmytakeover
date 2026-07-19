@@ -18,6 +18,8 @@ from azure.mgmt.redis import RedisManagementClient
 from azure.mgmt.sql import SqlManagementClient
 import click
 
+from collector import is_cloud_nameserver, zone_key
+
 _USE_CLI_CREDS = "default"
 
 
@@ -101,7 +103,19 @@ class azure:
                                 dnsdata.append(
                                     [subscription, fqdn, record.cname_record.cname]
                                 )
-                            # TODO: Implement ALIAS Records (Traffic Manager, Public IP, Azure CDN, Front Door, Static Web)
+                            # ALIAS records point at an Azure resource id (Traffic
+                            # Manager, Public IP, CDN, Front Door). Matched against
+                            # live resource ids collected in infra().
+                            elif record.target_resource and record.target_resource.id:
+                                dnsdata.append(
+                                    [subscription, fqdn, zone_key(record.target_resource.id)]
+                                )
+                            # Child NS delegation to a cloud NS pool → dangling if
+                            # the delegated zone is not in the inventory.
+                            elif record.ns_records and zone_key(fqdn) != zone_key(zone.name):
+                                nameservers = [ns.nsdname for ns in record.ns_records]
+                                if any(is_cloud_nameserver(ns) for ns in nameservers):
+                                    dnsdata.append([subscription, fqdn, zone_key(fqdn)])
             except HttpResponseError as e:
                 if "AuthorizationFailed" in str(e):
                     click.echo(f"Skipping subscription {subscription} - authorization failed")
@@ -142,6 +156,13 @@ class azure:
                 for rg in clients["resource"].resource_groups.list():
                     rg_name = rg.name
 
+                    # DNS zone names — the "live zones" a delegated NS record is
+                    # matched against to spot dangling delegations.
+                    for zone in clients["dns"].zones.list_by_resource_group(
+                        resource_group_name=rg_name
+                    ):
+                        infradata.append([subscription, "dnszone", zone_key(zone.name)])
+
                     # CDN Profiles and Endpoints
                     _collect_cdn_data(clients["cdn"], subscription, rg_name, infradata)
 
@@ -160,6 +181,8 @@ class azure:
                     ):
                         if ip.ip_address:
                             infradata.append([subscription, "publicip", ip.ip_address])
+                        if ip.id:  # resource id — target of an ALIAS record
+                            infradata.append([subscription, "publicip", zone_key(ip.id)])
 
                     # Traffic Manager Profiles
                     for profile in clients["traffic"].profiles.list_by_resource_group(
@@ -168,6 +191,10 @@ class azure:
                         if profile.dns_config and profile.dns_config.fqdn:
                             infradata.append(
                                 [subscription, "trafficmanager", profile.dns_config.fqdn]
+                            )
+                        if profile.id:  # resource id — target of an ALIAS record
+                            infradata.append(
+                                [subscription, "trafficmanager", zone_key(profile.id)]
                             )
 
                     # Storage Accounts
@@ -242,6 +269,7 @@ def _create_azure_clients(credentials, subscription):
     """Create all Azure management clients for a subscription."""
     return {
         "resource": ResourceManagementClient(credentials, subscription),
+        "dns": DnsManagementClient(credentials, subscription),
         "network": NetworkManagementClient(credentials, subscription),
         "cdn": CdnManagementClient(credentials, subscription),
         "traffic": TrafficManagerManagementClient(credentials, subscription),
@@ -269,6 +297,8 @@ def _collect_cdn_data(cdn_client, subscription, rg_name, infradata):
         ):
             if endpoint.host_name:
                 infradata.append([subscription, "cdn", endpoint.host_name])
+            if endpoint.id:  # resource id — target of an ALIAS record
+                infradata.append([subscription, "cdn", zone_key(endpoint.id)])
 
         # Azure Front Door endpoints
         for afd in cdn_client.afd_endpoints.list_by_profile(
@@ -276,6 +306,8 @@ def _collect_cdn_data(cdn_client, subscription, rg_name, infradata):
         ):
             if afd.host_name:
                 infradata.append([subscription, "frontdoor", afd.host_name])
+            if afd.id:  # resource id — target of an ALIAS record
+                infradata.append([subscription, "frontdoor", zone_key(afd.id)])
 
         # AFD Custom Domains
         for domain in cdn_client.afd_custom_domains.list_by_profile(

@@ -110,7 +110,8 @@ separately as "stale / out of scope," not as takeover risks:
 - **Email auth (DKIM/SPF etc.)** — CNAMEs into live SaaS provider zones
   (`*.dkim.*`, `*.domainkey.*`, `*.hubspotemail.net`, salesforce/highspot/etc.).
   Expected to have no infra in *your* accounts.
-- **MX / TXT / NS / SOA** — out of scope; never delete as part of this.
+- **MX / TXT / SOA / apex NS** — out of scope; never delete as part of this.
+  (Child NS *delegations* to a cloud NS pool are checked — see Pitfalls.)
 - **Resources in an account you didn't scan.** If a value points at real infra
   living in an account/project/subscription that wasn't in the config, it shows
   up as dangling but isn't. Widen the scan before trusting the result — this is
@@ -130,8 +131,10 @@ host, app) that exists in **none** of the accounts you scanned.
 - **Credentials must already work in the CLI.** The tool assumes roles / uses ADC
   / Azure login; it does not log you in. A permissions error means fix the cloud
   creds, not the tool.
-- **NS dangling is out of scope** — the tool does not detect dangling NS
-  delegations (documented limitation).
+- **NS dangling is partially covered** — the tool flags child NS delegations
+  that point at a cloud-provider nameserver pool (awsdns/azure-dns/googledomains)
+  but whose delegated zone no longer exists in any scanned account. Delegations
+  to other DNS providers are out of scope (can't be judged from cloud inventory).
 - **Matching is on the record value.** A CNAME/A whose value exactly matches a
   collected infra endpoint is considered live; partial/normalized mismatches
   (trailing dots, case) are worth spot-checking with `-d` if a known-good record

@@ -111,7 +111,7 @@ This repo is also a Claude Code plugin marketplace, so the skill can be installe
 ```
 
 ## Limtitations 
-This tools cannot guarantee 100% protection against subdomain takeovers. This will not protect you from dangling NS designations at the moment.
+This tools cannot guarantee 100% protection against subdomain takeovers. Dangling NS delegations are detected only when they point at a cloud-provider nameserver pool (AWS/Azure/GCP) — delegations to other DNS providers can't be judged from cloud inventory alone.
 
 ## Contributing
 

@@ -3,6 +3,8 @@
 import boto3
 import click
 
+from collector import is_cloud_nameserver, zone_key
+
 # Record types we're interested in
 _RELEVANT_RECORD_TYPES = frozenset(("A", "AAAA", "CNAME"))
 
@@ -37,15 +39,26 @@ class aws:
                 if zone["Config"]["PrivateZone"]:
                     continue
 
+                zone_name = zone["Name"]
                 records = client.list_resource_record_sets(HostedZoneId=zone["Id"])[
                     "ResourceRecordSets"
                 ]
 
                 for record in records:
-                    if record["Type"] not in _RELEVANT_RECORD_TYPES:
+                    record_name = record["Name"]
+
+                    # Child NS delegation: dangling if the delegated zone no longer
+                    # exists in any scanned account (see infra() hosted-zone rows).
+                    # Only flag delegations to a cloud NS pool — that's the takeover
+                    # vector; a delegation elsewhere we can't judge from inventory.
+                    if record["Type"] == "NS" and zone_key(record_name) != zone_key(zone_name):
+                        nameservers = [rr["Value"] for rr in record.get("ResourceRecords", [])]
+                        if any(is_cloud_nameserver(ns) for ns in nameservers):
+                            dnsdata.append([aws_account, record_name, zone_key(record_name)])
                         continue
 
-                    record_name = record["Name"]
+                    if record["Type"] not in _RELEVANT_RECORD_TYPES:
+                        continue
 
                     # Handle standard resource records
                     resource_records = record.get("ResourceRecords")
@@ -83,6 +96,12 @@ class aws:
             click.echo(
                 f"Getting Infrastructure details from AWS Account - {account_str}"
             )
+
+            # Hosted zone names (global) — the "live zones" a delegated NS record
+            # is matched against to spot dangling delegations.
+            route53_client = _create_client("route53", iamrole, aws_account)
+            for zone in route53_client.list_hosted_zones()["HostedZones"]:
+                infradata.append([aws_account, "hostedzone", zone_key(zone["Name"])])
 
             ec2_client = _create_client("ec2", iamrole, aws_account)
             regions = [

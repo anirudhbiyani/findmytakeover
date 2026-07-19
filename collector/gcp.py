@@ -10,6 +10,8 @@ from google.cloud import compute_v1
 from google.cloud import functions_v2
 import click
 
+from collector import is_cloud_nameserver, zone_key
+
 # Record types we're interested in for DNS
 _A_AAAA_TYPES = frozenset(("A", "AAAA"))
 _CNAME_TYPE = "CNAME"
@@ -77,6 +79,13 @@ class gcp:
                                 [proj, record_name, cname.rstrip(".")]
                                 for cname in record_set.rrdatas
                             )
+                        elif record_type == "NS" and zone_key(record_name) != zone_key(
+                            managed_zone.dns_name
+                        ):
+                            # Child delegation to a cloud NS pool → dangling if the
+                            # delegated zone is not in the inventory (see infra()).
+                            if any(is_cloud_nameserver(ns) for ns in record_set.rrdatas):
+                                dnsdata.append([proj, record_name, zone_key(record_name)])
             except Forbidden as e:
                 click.echo(
                     f"Skipping DNS collection for project {proj} - "
@@ -104,6 +113,15 @@ class gcp:
             click.echo(
                 f"Getting Infrastructure details from Google Cloud Project - {proj}"
             )
+
+            # DNS zone names — the "live zones" a delegated NS record is matched
+            # against to spot dangling delegations.
+            try:
+                dns_client = dns.client.Client(credentials=credentials, project=proj)
+                for managed_zone in dns_client.list_zones():
+                    infradata.append([proj, "dnszone", zone_key(managed_zone.dns_name)])
+            except Forbidden as e:
+                click.echo(f"Skipping DNS zones for project {proj} - access denied: {e.message}")
 
             # Cloud Storage Buckets
             try:
