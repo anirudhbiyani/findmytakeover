@@ -1,157 +1,138 @@
 ---
 name: dangling-dns-finder
 description: >-
-  Detect dangling DNS records and subdomain-takeover risks in a DNS zone. Use
-  whenever the user wants to find dangling domains/records, stale CNAMEs,
-  subdomain takeover exposure, orphaned DNS entries, or audit a DNS zone (e.g.
-  cloud.prophecy.io, example.com) for records pointing at deleted cloud
-  resources — dead load balancers (ELBs), released EC2/GCP/Azure IPs, or expired
-  SaaS targets. Triggers on "dangling domains", "dangling DNS", "subdomain
-  takeover", "audit my DNS zone", "find stale/orphaned DNS records", "dead
-  CNAMEs", or pointing at a Route53 zone and asking what's safe to delete. Works
-  for ANY zone the user can dump (Route53 by default; bring-your-own records JSON
-  otherwise).
+  Detect dangling DNS records and subdomain-takeover risks across a multi-cloud
+  environment by running the bundled findmytakeover tool. Use whenever the user
+  wants to find dangling domains/records, stale CNAMEs, subdomain takeover
+  exposure, orphaned DNS entries, or audit their DNS zones for records pointing
+  at deleted cloud resources — dead load balancers (ELBs), released
+  EC2/GCP/Azure IPs, or expired SaaS targets. Triggers on "dangling domains",
+  "dangling DNS", "subdomain takeover", "audit my DNS", "find stale/orphaned DNS
+  records", "dead CNAMEs", or asking what's safe to delete. Works across AWS,
+  GCP, and Azure using the accounts the user can already read.
 ---
 
 # Dangling DNS Finder
 
-Find DNS records that point at resources that no longer exist — the classic
-subdomain-takeover setup. A `CNAME` to a deleted ELB or a SaaS tenant that was
-cancelled, or an `A` record to a released cloud IP, can be silently reclaimed by
-someone else and used to serve content under your domain.
+Find DNS records that point at infrastructure that no longer exists — the
+classic subdomain-takeover setup. A `CNAME` to a deleted ELB, or an `A` record
+to a released cloud IP, can be silently reclaimed by someone else and used to
+serve content under your domain.
 
-## What counts as "dangling"
+This skill drives the repo's own tool, [`findmytakeover.py`](../../findmytakeover.py).
+It enumerates every DNS record **and** every live infrastructure endpoint
+(IPs, ELB/LB hostnames, etc.) across the configured AWS/GCP/Azure accounts,
+then reports any DNS record whose value has **no** matching live resource. No
+wordlists, no guessing — a record is dangling because the thing it points at is
+not in your inventory.
 
-Two distinct, verifiable signals — keep them separate, they have different
-confidence and different remediation:
+Do **not** write new scripts to resolve DNS or probe endpoints — the tool
+already collects both sides and diffs them. Your job is to configure it, run
+it, and interpret the output.
 
-1. **CNAME / ALIAS → NXDOMAIN.** The target hostname no longer resolves *at
-   all*. For AWS this is definitive: if an ELB existed in any account, AWS's own
-   authoritative DNS would answer. NXDOMAIN = the backing resource is gone.
-   **High confidence.**
-2. **A record → IP that isn't yours and doesn't respond.** The IP is absent from
-   your cloud inventory (no EIP/ENI/static-address/instance owns it) *and* it
-   doesn't answer HTTP. **Medium-high confidence** — see the caveats, this one
-   has more ways to be wrong.
+## Prerequisites
+
+- Read-only cloud credentials for the accounts being scanned, already set up in
+  the local CLIs:
+  - **AWS** — `ViewOnlyAccess` + `SecurityAudit` (or an assumable IAM role)
+  - **GCP** — `Viewer` (Application Default Credentials, or a service-account key)
+  - **Azure** — `Reader` (Azure CLI login, or tenant/client/secret)
+- Dependencies: `pip3 install .` from the repo root (installs from `pyproject.toml`).
 
 ## Workflow
 
-Run the bundled scripts in order. They are bash (run via `bash script.sh`, not
-zsh — see Pitfalls). All write to an output dir you pass.
+### 1. Configure
 
-### 1. Scan the zone
+The tool reads [`findmytakeover.config`](../../findmytakeover.config) (YAML) —
+default path is the repo root, override with `-c`. Enable only the providers the
+user actually has. For each, set `enabled: true` and pick credentials:
 
-```bash
-bash scripts/find_dangling.sh <zone_name> <aws_profile> [outdir]
-# e.g. bash scripts/find_dangling.sh cloud.prophecy.io dns ./out
-```
+- `credentials: default` — use the local CLI's logged-in creds and auto-discover
+  accounts/projects/subscriptions. Simplest; prefer this.
+- Otherwise an IAM role name (AWS), a service-account JSON path (GCP), or a
+  tenant/client/secret mapping (Azure) — and list `accounts:` explicitly.
 
-This finds the Route53 hosted zone, dumps all records to `<outdir>/records.json`,
-then:
-- Resolves every CNAME/ALIAS target. NXDOMAIN is **re-checked against 8.8.8.8 and
-  1.1.1.1** before being trusted (a single resolver can flake). → `dangling_cname.tsv`
-- Categorizes each target so validation records aren't misreported as takeovers
-  (see Classification). → category column
-- HTTP-probes every A-record host; no response = candidate. → `dangling_a.tsv`
+A provider appears under both `dns:` and `infra:` — both must be enabled for the
+dangling check to run (it needs both sides to diff). Use `exclude:` for IP
+ranges/domains that are known-safe and should never be flagged (e.g. SaaS email
+domains, reserved ranges).
 
-If the zone is **not** in Route53, skip the dump and hand the script a records
-JSON in the same shape (`{"ResourceRecordSets":[...]}`) — or just run the
-resolution/liveness logic against a list of names you already have.
+Confirm the config with the user before running — wrong account scope is the
+main way this wastes time.
 
-### 2. (Recommended) Confirm A-record candidates against cloud inventory
-
-Liveness alone is a heuristic. For real confidence on A records, cross-reference
-the IPs against what your accounts actually own:
+### 2. Run
 
 ```bash
-bash scripts/audit_a_inventory.sh <outdir> [aws_profiles] [gcp] [azure]
-# e.g. bash scripts/audit_a_inventory.sh ./out "dns prof-prod staging" yes yes
+python3 findmytakeover.py -c findmytakeover.config
+# add -d dump.csv to also save the raw DNS + infrastructure inventory
 ```
 
-An A-record IP that is **both** absent from every account's inventory **and**
-unreachable over HTTP is a genuine dangling candidate. An IP that responds — even
-404 — is in use (often via a load-balancer/forwarding-rule IP that doesn't show
-up in a plain instance/EIP listing), so treat it as live and keep it.
+It prints how many DNS records and infra resources it collected per provider,
+then one line per dangling record:
+
+```
+Found dangling DNS record - <name> with value <value> in <cloud> cloud (account/...: <id>)
+```
+
+Use `-d <file>` whenever the user wants to inspect the raw data or when a result
+looks surprising — the dump shows exactly what DNS and infra were compared.
 
 ### 3. Report
 
-Present a single consolidated table: **IP/Target · Cloud · Subdomain**, grouped
-by category, with counts. State confidence per bucket and call out anything
-sensitive (customer-named subdomains, `*-prod` hosts) for manual confirmation
-before deletion.
+Present the dangling records as a table: **Subdomain · Value (target) · Cloud ·
+Account**. Group by cloud. Call out anything sensitive (customer-named
+subdomains, `*-prod` hosts) for manual confirmation before any deletion.
 
-### 4. Generate the delete command (show, don't run)
+Frame confidence honestly (see Interpreting results) — a value missing from the
+inventory is a strong signal, not proof, and some classes of record are expected
+to have no backing infra.
 
-```bash
-bash scripts/build_delete_batch.sh <outdir>/records.json <names.txt> <outdir>/delete-batch.json
-```
+### 4. Remediate (show, don't run)
 
-`names.txt` = one FQDN per line **with trailing dot**, matching record names
-(`find_dangling.sh` writes `dangling_names.txt` for the takeover-risk set and
-`validation_names.txt` for stale validation records). Then show the user:
+The tool only reports; it does not delete. For each confirmed dangling record,
+show the user the deletion command for their DNS provider (e.g.
+`aws route53 change-resource-record-sets` with a change batch, `gcloud dns
+record-sets delete`, `az network dns record-set ... delete`).
 
-```bash
-aws route53 change-resource-record-sets \
-  --hosted-zone-id <ZID> \
-  --change-batch file://<outdir>/delete-batch.json \
-  --profile <profile>
-```
+DNS deletion is hard to reverse and outward-facing — default to **showing** the
+command and letting the user run it. Only run it yourself if they explicitly say
+so, and never batch-delete customer-named or `*-prod` records without a
+record-by-record confirmation.
 
-Default to **showing** the command and letting the user run it. DNS deletion is
-hard to reverse and outward-facing — only run it yourself if the user explicitly
-says so. The build step prints a count; it must equal your name list before the
-delete is safe to run.
+## Interpreting results — what is NOT a takeover risk
 
-## Classification — what is NOT a takeover risk
+A record can have no matching infra yet be perfectly fine. Bucket these
+separately as "stale / out of scope," not as takeover risks:
 
-Plenty of records resolve to nothing or look dead but are harmless. Don't report
-these as dangling domains; bucket them separately as "stale, optional cleanup":
-
-- **ACM cert validation** — CNAME → `*.acm-validations.aws`. Normal; resolves to
-  no A record. Stale only if the cert is gone.
-- **Google cert-manager validation** — CNAME → `*.authorize.certificatemanager.goog`.
-  `_acme-challenge_*` names. Single-use DNS-01 tokens, **not** service endpoints —
-  even when NXDOMAIN they are not a takeover vector.
-- **DKIM / email auth** — CNAME → `*.dkim.*`, `*.custdkim.salesforce.com`,
-  `*.hubspotemail.net`, `*.domainkey.*`, `*.deliver.highspot.com`, `freshemail.io`.
-  These point into live SaaS provider zones; `NOERROR` with no A record is expected.
+- **Cert validation** — `*.acm-validations.aws`, `*.authorize.certificatemanager.goog`,
+  `_acme-challenge.*`. These point at validation zones / single-use tokens, not
+  service endpoints. Not a takeover vector.
+- **Email auth (DKIM/SPF etc.)** — CNAMEs into live SaaS provider zones
+  (`*.dkim.*`, `*.domainkey.*`, `*.hubspotemail.net`, salesforce/highspot/etc.).
+  Expected to have no infra in *your* accounts.
 - **MX / TXT / NS / SOA** — out of scope; never delete as part of this.
+- **Resources in an account you didn't scan.** If a value points at real infra
+  living in an account/project/subscription that wasn't in the config, it shows
+  up as dangling but isn't. Widen the scan before trusting the result — this is
+  the #1 false positive. Add such ranges/domains to `exclude:` once confirmed.
 
-Only a CNAME/ALIAS whose target is a real endpoint (ELB, cloud host, app) AND
-returns NXDOMAIN is a takeover risk.
+A genuine takeover risk is a record pointing at a real endpoint (ELB, cloud
+host, app) that exists in **none** of the accounts you scanned.
 
-## Pitfalls (these cost real time — heed them)
+## Pitfalls
 
-- **Run scripts with `bash`, not zsh.** In zsh `status` is a read-only variable;
-  a loop doing `status=$(...)` dies instantly. The scripts use `bash` shebangs and
-  the var name `st` — keep it that way.
-- **macOS has no `timeout`/`gtimeout`.** Don't rely on it. Use `curl -m <secs>`
-  for bounded network calls (the scripts do).
-- **Raw `/dev/tcp` port probes are often blocked** outbound from a dev machine —
-  they return uniform failure and look like "everything is dead." Use `curl -m`
-  for liveness, and sanity-check the probe against a known-live host first.
-- **"Not in my cloud inventory" ≠ dangling for GCP/Azure.** Plain
-  instance/address listings miss GKE/LB forwarding-rule IPs and any project you
-  lack read access to. Always confirm with an HTTP liveness probe; an IP that
-  answers is in use even if your inventory sweep didn't find it.
-- **A live VM firewalled from you can false-positive as dead.** If the whole
-  inventory of live IPs also responds, blanket-firewalling isn't happening and
-  confidence is high — but still spot-check `*-prod` / customer hosts before
-  deleting.
-- **Escaped record names** (e.g. `\100.example.com`, octal/decimal escapes,
-  wildcards `\052` = `*`) break naive `curl` probes — the script skips them; verify
-  those by reading the record's value directly (`dig` / the zone dump), don't
-  assume dead.
-- **Verify NXDOMAIN across multiple resolvers** (8.8.8.8 + 1.1.1.1) before
-  trusting it. The script does this for you.
-- **Zones can live in different accounts/profiles.** Don't assume one profile
-  owns every zone — look the zone up per profile, and run the delete with the
-  profile that actually owns it.
-- **`build_delete_batch.sh` matches by name**, so it removes *all* record types
-  at a matched name. That's fine for single-type danglers; if a dangling name
-  also carries a record you want to keep (e.g. a TXT), edit the batch by hand.
-
-## Self-check
-
-`bash scripts/selftest.sh` asserts the target classifier (ACM / cert-manager /
-DKIM / endpoint) still buckets correctly. Run it after editing the classifier.
+- **Incomplete account scope = false positives.** The tool can only match against
+  infra in the accounts it can read. A value owned by an unscanned account looks
+  dangling. Always confirm the config covers every account that could own the
+  targets before reporting.
+- **Both `dns` and `infra` must be enabled** (and for the same providers you care
+  about) or there's nothing to diff — the tool will say so and exit.
+- **Credentials must already work in the CLI.** The tool assumes roles / uses ADC
+  / Azure login; it does not log you in. A permissions error means fix the cloud
+  creds, not the tool.
+- **NS dangling is out of scope** — the tool does not detect dangling NS
+  delegations (documented limitation).
+- **Matching is on the record value.** A CNAME/A whose value exactly matches a
+  collected infra endpoint is considered live; partial/normalized mismatches
+  (trailing dots, case) are worth spot-checking with `-d` if a known-good record
+  shows up as dangling.

@@ -6,17 +6,21 @@ import click
 # Record types we're interested in
 _RELEVANT_RECORD_TYPES = frozenset(("A", "AAAA", "CNAME"))
 
+_USE_CLI_CREDS = "default"
+
 
 class aws:
     @staticmethod
     def dns(accounts, iamrole):
         """Collect DNS records from AWS accounts via Route53."""
         dnsdata = []
+        use_default = _is_default_credentials(iamrole)
+        accounts = _resolve_accounts(accounts, use_default)
 
         for aws_account in accounts:
             account_str = str(aws_account)
 
-            if len(account_str) != 12:
+            if not use_default and len(account_str) != 12:
                 click.echo(
                     f"Please check the AWS Account number {aws_account}. It does not seem to be valid."
                 )
@@ -24,8 +28,7 @@ class aws:
 
             click.echo(f"Reading DNS data from AWS Account - {account_str}")
 
-            credentials = _assume_role(aws_account, iamrole)
-            client = _create_client("route53", credentials)
+            client = _create_client("route53", iamrole, aws_account)
 
             hosted_zones = client.list_hosted_zones()["HostedZones"]
 
@@ -65,11 +68,13 @@ class aws:
     def infra(accounts, iamrole):
         """Collect infrastructure data from AWS accounts."""
         infradata = []
+        use_default = _is_default_credentials(iamrole)
+        accounts = _resolve_accounts(accounts, use_default)
 
         for aws_account in accounts:
             account_str = str(aws_account)
 
-            if len(account_str) != 12:
+            if not use_default and len(account_str) != 12:
                 click.echo(
                     f"Please check the AWS Account number {aws_account}. It does not seem to be valid."
                 )
@@ -79,17 +84,14 @@ class aws:
                 f"Getting Infrastructure details from AWS Account - {account_str}"
             )
 
-            credentials = _assume_role(aws_account, iamrole)
-
-            # Get all enabled regions
-            ec2_client = _create_client("ec2", credentials)
+            ec2_client = _create_client("ec2", iamrole, aws_account)
             regions = [
                 r["RegionName"] for r in ec2_client.describe_regions()["Regions"]
             ]
 
             for region in regions:
                 try:
-                    _collect_region_infra(aws_account, credentials, region, infradata)
+                    _collect_region_infra(aws_account, iamrole, region, infradata)
                     click.echo(
                         f"Completed collecting Infrastructure details from account {account_str} in region {region}"
                     )
@@ -97,6 +99,24 @@ class aws:
                     continue
 
         return infradata
+
+
+def _is_default_credentials(iamrole):
+    """Check if the caller wants to use local CLI credentials."""
+    return str(iamrole).strip().lower() == _USE_CLI_CREDS
+
+
+def _resolve_accounts(accounts, use_default):
+    """Return the account list, auto-discovering profiles from ~/.aws/config when using default credentials."""
+    if not use_default:
+        return accounts
+
+    if accounts:
+        return accounts
+
+    profiles = boto3.Session().available_profiles
+    click.echo(f"Auto-discovered {len(profiles)} AWS profile(s) from ~/.aws/config: {', '.join(profiles)}")
+    return profiles
 
 
 def _assume_role(aws_account, iamrole):
@@ -109,23 +129,35 @@ def _assume_role(aws_account, iamrole):
     return assume_role_response["Credentials"]
 
 
-def _create_client(service, credentials, region=None):
-    """Create a boto3 client with the given credentials."""
-    kwargs = {
+_DEFAULT_REGION = "us-east-1"
+
+
+def _create_client(service, iamrole, aws_account=None, region=None):
+    """Create a boto3 client, using a named CLI profile or assumed role."""
+    kwargs = {}
+    if region:
+        kwargs["region_name"] = region
+
+    if _is_default_credentials(iamrole):
+        session = boto3.Session(profile_name=aws_account)
+        if not region and not session.region_name:
+            kwargs["region_name"] = _DEFAULT_REGION
+        return session.client(service, **kwargs)
+
+    credentials = _assume_role(aws_account, iamrole)
+    kwargs.update({
         "aws_access_key_id": credentials["AccessKeyId"],
         "aws_secret_access_key": credentials["SecretAccessKey"],
         "aws_session_token": credentials["SessionToken"],
-    }
-    if region:
-        kwargs["region_name"] = region
+    })
     return boto3.client(service, **kwargs)
 
 
-def _collect_region_infra(aws_account, credentials, region, infradata):
+def _collect_region_infra(aws_account, iamrole, region, infradata):
     """Collect infrastructure data from a specific region."""
 
     # EC2 Instances
-    ec2_client = _create_client("ec2", credentials, region)
+    ec2_client = _create_client("ec2", iamrole, aws_account, region)
     reservations = ec2_client.describe_instances()["Reservations"]
     for reservation in reservations:
         for instance in reservation["Instances"]:
@@ -138,19 +170,19 @@ def _collect_region_infra(aws_account, credentials, region, infradata):
                     )
 
     # Classic Load Balancers
-    elb_client = _create_client("elb", credentials, region)
+    elb_client = _create_client("elb", iamrole, aws_account, region)
     for lb in elb_client.describe_load_balancers()["LoadBalancerDescriptions"]:
         if lb["Scheme"] == "internet-facing":
             infradata.append([aws_account, "elb", lb["DNSName"]])
 
     # Application/Network Load Balancers
-    elbv2_client = _create_client("elbv2", credentials, region)
+    elbv2_client = _create_client("elbv2", iamrole, aws_account, region)
     for lb in elbv2_client.describe_load_balancers()["LoadBalancers"]:
         if lb["Scheme"] == "internet-facing":
             infradata.append([aws_account, "elbv2", lb["DNSName"]])
 
     # Elastic Beanstalk
-    beanstalk_client = _create_client("elasticbeanstalk", credentials, region)
+    beanstalk_client = _create_client("elasticbeanstalk", iamrole, aws_account, region)
     for app in beanstalk_client.describe_applications()["Applications"]:
         environments = beanstalk_client.describe_environments(
             ApplicationName=app["ApplicationName"]
@@ -160,7 +192,7 @@ def _collect_region_infra(aws_account, credentials, region, infradata):
             infradata.append([aws_account, "elasticbeanstalk", env["CNAME"]])
 
     # CloudFront Distributions
-    cloudfront_client = _create_client("cloudfront", credentials, region)
+    cloudfront_client = _create_client("cloudfront", iamrole, aws_account, region)
     distributions = cloudfront_client.list_distributions()
     dist_list = distributions.get("DistributionList", {})
     if dist_list and "Items" in dist_list:
@@ -168,19 +200,19 @@ def _collect_region_infra(aws_account, credentials, region, infradata):
             infradata.append([aws_account, "cloudfront", dist["DomainName"]])
 
     # S3 Buckets
-    s3_client = _create_client("s3", credentials, region)
+    s3_client = _create_client("s3", iamrole, aws_account, region)
     for bucket in s3_client.list_buckets()["Buckets"]:
         infradata.append([aws_account, "s3", bucket["Name"]])
 
     # RDS Instances
-    rds_client = _create_client("rds", credentials, region)
+    rds_client = _create_client("rds", iamrole, aws_account, region)
     for db in rds_client.describe_db_instances()["DBInstances"]:
         endpoint = db.get("Endpoint")
         if endpoint:
             infradata.append([aws_account, "rds", endpoint["Address"]])
 
     # OpenSearch/Elasticsearch Domains
-    opensearch_client = _create_client("opensearch", credentials, region)
+    opensearch_client = _create_client("opensearch", iamrole, aws_account, region)
 
     for engine_type in ("OpenSearch", "Elasticsearch"):
         domains = opensearch_client.list_domain_names(EngineType=engine_type)[
@@ -195,7 +227,7 @@ def _collect_region_infra(aws_account, credentials, region, infradata):
                 infradata.append([aws_account, "opensearch", endpoint])
 
     # API Gateway
-    apigateway_client = _create_client("apigatewayv2", credentials, region)
+    apigateway_client = _create_client("apigatewayv2", iamrole, aws_account, region)
     apis = apigateway_client.get_apis()
     for api in apis.get("Items", []):
         api_endpoint = api.get("ApiEndpoint")

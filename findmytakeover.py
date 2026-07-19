@@ -101,8 +101,12 @@ def _parse_providers(config, section):
             credentials = provider_config.get("credentials")
             accounts = provider_config.get("accounts")
 
-            if credentials is None or accounts is None:
-                raise KeyError(f"Missing credentials or accounts for {provider_name}")
+            if credentials is None:
+                raise KeyError(f"Missing credentials for {provider_name}")
+
+            use_default = isinstance(credentials, str) and credentials.strip().lower() == "default"
+            if not use_default and not accounts:
+                raise KeyError(f"Missing accounts for {provider_name} (required when not using 'default' credentials)")
 
             providers[provider_name] = {
                 "credentials": credentials,
@@ -131,10 +135,13 @@ def _collect_dns_records(dns_config):
         collector = _get_collector(provider)
 
         data = collector.dns(config["accounts"], config["credentials"])
-        records.extend(
+        provider_records = [
             [provider_name, item[0], item[1], item[2]] for item in data
-        )
+        ]
+        click.echo(f"Collected {len(provider_records)} DNS record(s) from {provider_name}")
+        records.extend(provider_records)
 
+    click.echo(f"Total DNS records collected: {len(records)}")
     return records
 
 
@@ -153,10 +160,13 @@ def _collect_infrastructure(infra_config):
         collector = _get_collector(provider)
 
         data = collector.infra(config["accounts"], config["credentials"])
-        infrastructure.extend(
+        provider_infra = [
             [provider_name, item[0], item[1], item[2]] for item in data
-        )
+        ]
+        click.echo(f"Collected {len(provider_infra)} infrastructure resource(s) from {provider_name}")
+        infrastructure.extend(provider_infra)
 
+    click.echo(f"Total infrastructure resources collected: {len(infrastructure)}")
     return infrastructure
 
 

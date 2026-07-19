@@ -1,6 +1,9 @@
 #!/usr/bin/env python3
 
+import google.auth
+from google.api_core.exceptions import Forbidden
 from google.cloud import dns
+from google.cloud import resourcemanager_v3
 from google.oauth2 import service_account
 from google.cloud import storage
 from google.cloud import compute_v1
@@ -11,43 +14,83 @@ import click
 _A_AAAA_TYPES = frozenset(("A", "AAAA"))
 _CNAME_TYPE = "CNAME"
 
+_USE_CLI_CREDS = "default"
+
+
+def _is_default_credentials(path):
+    return str(path).strip().lower() == _USE_CLI_CREDS
+
+
+def _load_credentials(path):
+    """Return GCP credentials from a service account file or Application Default Credentials."""
+    if _is_default_credentials(path):
+        credentials, _ = google.auth.default()
+        return credentials
+    return service_account.Credentials.from_service_account_file(path)
+
+
+def _resolve_projects(projects, credentials, use_default):
+    """Return the project list, auto-discovering from Resource Manager when using default credentials."""
+    if not use_default:
+        return projects
+
+    if projects:
+        return projects
+
+    client = resourcemanager_v3.ProjectsClient(credentials=credentials)
+    discovered = []
+    for project in client.search_projects(query="state:ACTIVE"):
+        discovered.append(project.project_id)
+
+    click.echo(f"Auto-discovered {len(discovered)} GCP project(s) from CLI credentials")
+    return discovered
+
 
 class gcp:
     @staticmethod
     def dns(projects, path):
         """Collect DNS records from GCP projects."""
-        credentials = service_account.Credentials.from_service_account_file(path)
+        credentials = _load_credentials(path)
+        projects = _resolve_projects(projects, credentials, _is_default_credentials(path))
         dnsdata = []
 
         for proj in projects:
             click.echo(f"Reading DNS data from Google Cloud Project - {proj}")
-            dns_client = dns.client.Client(credentials=credentials, project=proj)
+            try:
+                dns_client = dns.client.Client(credentials=credentials, project=proj)
 
-            for managed_zone in dns_client.list_zones():
-                dns_record_client = dns.zone.ManagedZone(
-                    name=managed_zone.name, client=dns_client
+                for managed_zone in dns_client.list_zones():
+                    dns_record_client = dns.zone.ManagedZone(
+                        name=managed_zone.name, client=dns_client
+                    )
+
+                    for record_set in dns_record_client.list_resource_record_sets():
+                        record_type = record_set.record_type
+                        record_name = record_set.name.rstrip(".")
+
+                        if record_type in _A_AAAA_TYPES:
+                            dnsdata.extend(
+                                [proj, record_name, ip] for ip in record_set.rrdatas
+                            )
+                        elif record_type == _CNAME_TYPE:
+                            dnsdata.extend(
+                                [proj, record_name, cname.rstrip(".")]
+                                for cname in record_set.rrdatas
+                            )
+            except Forbidden as e:
+                click.echo(
+                    f"Skipping DNS collection for project {proj} - "
+                    f"access denied (Cloud DNS API may not be enabled): {e.message}"
                 )
-
-                for record_set in dns_record_client.list_resource_record_sets():
-                    record_type = record_set.record_type
-                    record_name = record_set.name.rstrip(".")
-
-                    if record_type in _A_AAAA_TYPES:
-                        dnsdata.extend(
-                            [proj, record_name, ip] for ip in record_set.rrdatas
-                        )
-                    elif record_type == _CNAME_TYPE:
-                        dnsdata.extend(
-                            [proj, record_name, cname.rstrip(".")]
-                            for cname in record_set.rrdatas
-                        )
+                continue
 
         return dnsdata
 
     @staticmethod
     def infra(projects, path):
         """Collect infrastructure data from GCP projects."""
-        credentials = service_account.Credentials.from_service_account_file(path)
+        credentials = _load_credentials(path)
+        projects = _resolve_projects(projects, credentials, _is_default_credentials(path))
         infradata = []
 
         # Pre-create clients that can be reused (they use per-request project context)
@@ -63,43 +106,55 @@ class gcp:
             )
 
             # Cloud Storage Buckets
-            storage_client = storage.Client(credentials=credentials, project=proj)
-            infradata.extend(
-                [proj, "bucket", bucket.name]
-                for bucket in storage_client.list_buckets()
-            )
+            try:
+                storage_client = storage.Client(credentials=credentials, project=proj)
+                infradata.extend(
+                    [proj, "bucket", bucket.name]
+                    for bucket in storage_client.list_buckets()
+                )
+            except Forbidden as e:
+                click.echo(f"Skipping Storage for project {proj} - access denied: {e.message}")
 
             # LoadBalancer IP Addresses
-            for _, response in forwarding_rules_client.aggregated_list(project=proj):
-                if response.forwarding_rules:
-                    infradata.extend(
-                        [proj, "loadbalancer", rule.IP_address]
-                        for rule in response.forwarding_rules
-                    )
+            try:
+                for _, response in forwarding_rules_client.aggregated_list(project=proj):
+                    if response.forwarding_rules:
+                        infradata.extend(
+                            [proj, "loadbalancer", rule.I_p_address]
+                            for rule in response.forwarding_rules
+                        )
+            except Forbidden as e:
+                click.echo(f"Skipping Forwarding Rules for project {proj} - access denied: {e.message}")
 
             # Cloud Functions
-            functions_request = functions_v2.ListFunctionsRequest(
-                parent=f"projects/{proj}/locations/-"
-            )
-            for func in function_client.list_functions(request=functions_request):
-                uri = func.service_config.uri
-                if uri:
-                    infradata.append(
-                        [proj, "cloudfunction", uri.removeprefix("https://")]
-                    )
+            try:
+                functions_request = functions_v2.ListFunctionsRequest(
+                    parent=f"projects/{proj}/locations/-"
+                )
+                for func in function_client.list_functions(request=functions_request):
+                    uri = func.service_config.uri
+                    if uri:
+                        infradata.append(
+                            [proj, "cloudfunction", uri.removeprefix("https://")]
+                        )
+            except Forbidden as e:
+                click.echo(f"Skipping Cloud Functions for project {proj} - access denied: {e.message}")
 
             # Virtual Machines - collect public IPs
-            instances_request = compute_v1.AggregatedListInstancesRequest(project=proj)
-            for _, response in instances_client.aggregated_list(
-                request=instances_request
-            ):
-                if response.instances:
-                    for instance in response.instances:
-                        for network in instance.network_interfaces:
-                            infradata.extend(
-                                [proj, "virtualmachine", access_config.nat_i_p]
-                                for access_config in network.access_configs
-                                if access_config.nat_i_p
-                            )
+            try:
+                instances_request = compute_v1.AggregatedListInstancesRequest(project=proj)
+                for _, response in instances_client.aggregated_list(
+                    request=instances_request
+                ):
+                    if response.instances:
+                        for instance in response.instances:
+                            for network in instance.network_interfaces:
+                                infradata.extend(
+                                    [proj, "virtualmachine", access_config.nat_i_p]
+                                    for access_config in network.access_configs
+                                    if access_config.nat_i_p
+                                )
+            except Forbidden as e:
+                click.echo(f"Skipping Compute Instances for project {proj} - access denied: {e.message}")
 
         return infradata

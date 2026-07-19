@@ -1,0 +1,17 @@
+{
+  "$schema": "https://anthropic.com/claude-code/marketplace.schema.json",
+  "name": "findmytakeover",
+  "description": "Dangling DNS / subdomain-takeover auditing for multi-cloud environments.",
+  "owner": {
+    "name": "Anirudh Biyani",
+    "url": "https://github.com/anirudhbiyani"
+  },
+  "plugins": [
+    {
+      "name": "findmytakeover",
+      "description": "Find dangling DNS records vulnerable to subdomain takeover across AWS, GCP, and Azure.",
+      "source": "./",
+      "category": "security"
+    }
+  ]
+}
