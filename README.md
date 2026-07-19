@@ -25,6 +25,8 @@ Depending on the cloud provider, you would need permission read data. The follow
   - Amazon Web Services - ViewOnlyRole and SecurityAudit
   - Microsoft Azure - Reader
   - Google Cloud - Viewer
+  - Cloudflare - API token with Zone:Read, DNS:Read, Account:Read, Pages:Read
+  - Oracle Cloud (OCI) - a group with `inspect`/`read` on dns, instances, load-balancers, and object-storage
 
 ## Usage
 ```

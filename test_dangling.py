@@ -8,7 +8,7 @@ inventories — no cloud calls. Run: python3 test_dangling.py
 import pandas as pd
 
 from collector import is_cloud_nameserver, zone_key
-from findmytakeover import _find_dangling_records
+from findmytakeover import _find_dangling_records, _parse_providers
 
 RECORD_COLS = ["csp", "account", "dnskey", "dnsvalue"]
 INFRA_COLS = ["csp", "account", "service", "value"]
@@ -54,8 +54,16 @@ def test_azure_alias():
     assert _dangling_values(records, infra) == {zone_key(gone_id)}
 
 
+def test_empty_provider_block():
+    # An empty provider block parses as None — must be skipped, not crash.
+    assert _parse_providers({"dns": {"aws": None}}, "dns") == {}
+    # A disabled provider is also skipped.
+    assert _parse_providers({"dns": {"aws": {"enabled": False}}}, "dns") == {}
+
+
 if __name__ == "__main__":
     test_helpers()
     test_dangling_ns_delegation()
     test_azure_alias()
+    test_empty_provider_block()
     print("ok")

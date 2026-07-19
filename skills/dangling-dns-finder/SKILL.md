@@ -37,6 +37,8 @@ it, and interpret the output.
   - **AWS** — `ViewOnlyAccess` + `SecurityAudit` (or an assumable IAM role)
   - **GCP** — `Viewer` (Application Default Credentials, or a service-account key)
   - **Azure** — `Reader` (Azure CLI login, or tenant/client/secret)
+  - **Cloudflare** — read-only API token (`CLOUDFLARE_API_TOKEN` env, or a token string)
+  - **Oracle (OCI)** — `read`/`inspect` group (`~/.oci/config` DEFAULT profile, or a config path)
 - Dependencies: `pip3 install .` from the repo root (installs from `pyproject.toml`).
 
 ## Workflow
@@ -135,6 +137,9 @@ host, app) that exists in **none** of the accounts you scanned.
   that point at a cloud-provider nameserver pool (awsdns/azure-dns/googledomains)
   but whose delegated zone no longer exists in any scanned account. Delegations
   to other DNS providers are out of scope (can't be judged from cloud inventory).
+  The delegated zone is proven "live" from the **infra** side (zone-name rows),
+  so the provider hosting the child zone must have `infra` enabled and scanned —
+  otherwise a live delegation looks dangling.
 - **Matching is on the record value.** A CNAME/A whose value exactly matches a
   collected infra endpoint is considered live; partial/normalized mismatches
   (trailing dots, case) are worth spot-checking with `-d` if a known-good record

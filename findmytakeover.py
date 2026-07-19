@@ -10,13 +10,15 @@ import pandas as pd
 import yaml
 
 # Supported cloud providers
-_SUPPORTED_PROVIDERS = frozenset(("aws", "gcp", "azure"))
+_SUPPORTED_PROVIDERS = frozenset(("aws", "gcp", "azure", "cloudflare", "oracle"))
 
 # Provider display names
 _PROVIDER_NAMES = {
     "aws": "Amazon Web Services",
     "gcp": "Google Cloud Platform",
     "azure": "Microsoft Azure",
+    "cloudflare": "Cloudflare",
+    "oracle": "Oracle Cloud Infrastructure",
 }
 
 CLI_PROMPT = r"""        
@@ -95,7 +97,9 @@ def _parse_providers(config, section):
 
     try:
         for provider_name, provider_config in config[section].items():
-            if not provider_config.get("enabled"):
+            # An empty provider block (e.g. "aws:" with nothing under it) parses
+            # as None — treat it as disabled rather than crashing on .get().
+            if not provider_config or not provider_config.get("enabled"):
                 continue
 
             credentials = provider_config.get("credentials")
@@ -181,6 +185,12 @@ def _get_collector(provider):
     elif provider == "azure":
         from collector.msazure import azure
         return azure
+    elif provider == "cloudflare":
+        from collector.cloudflare import cloudflare
+        return cloudflare
+    elif provider == "oracle":
+        from collector.oracle import oracle
+        return oracle
 
 
 def _find_dangling_records(records_df, infrastructure_df, exclusions):

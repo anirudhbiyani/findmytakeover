@@ -9,6 +9,16 @@ from collector import is_cloud_nameserver, zone_key
 _RELEVANT_RECORD_TYPES = frozenset(("A", "AAAA", "CNAME"))
 
 _USE_CLI_CREDS = "default"
+_DEFAULT_REGION = "us-east-1"
+
+
+def _paginate(client, method, result_key, **kwargs):
+    """Yield every item across all pages, using a boto3 paginator when one exists."""
+    if client.can_paginate(method):
+        for page in client.get_paginator(method).paginate(**kwargs):
+            yield from page.get(result_key, [])
+    else:
+        yield from getattr(client, method)(**kwargs).get(result_key, [])
 
 
 class aws:
@@ -32,25 +42,23 @@ class aws:
 
             client = _create_client("route53", iamrole, aws_account)
 
-            hosted_zones = client.list_hosted_zones()["HostedZones"]
-
-            for zone in hosted_zones:
+            for zone in _paginate(client, "list_hosted_zones", "HostedZones"):
                 # Skip private zones
                 if zone["Config"]["PrivateZone"]:
                     continue
 
                 zone_name = zone["Name"]
-                records = client.list_resource_record_sets(HostedZoneId=zone["Id"])[
-                    "ResourceRecordSets"
-                ]
-
-                for record in records:
+                for record in _paginate(
+                    client,
+                    "list_resource_record_sets",
+                    "ResourceRecordSets",
+                    HostedZoneId=zone["Id"],
+                ):
                     record_name = record["Name"]
 
                     # Child NS delegation: dangling if the delegated zone no longer
                     # exists in any scanned account (see infra() hosted-zone rows).
-                    # Only flag delegations to a cloud NS pool — that's the takeover
-                    # vector; a delegation elsewhere we can't judge from inventory.
+                    # Only flag delegations to a cloud NS pool — the takeover vector.
                     if record["Type"] == "NS" and zone_key(record_name) != zone_key(zone_name):
                         nameservers = [rr["Value"] for rr in record.get("ResourceRecords", [])]
                         if any(is_cloud_nameserver(ns) for ns in nameservers):
@@ -97,11 +105,8 @@ class aws:
                 f"Getting Infrastructure details from AWS Account - {account_str}"
             )
 
-            # Hosted zone names (global) — the "live zones" a delegated NS record
-            # is matched against to spot dangling delegations.
-            route53_client = _create_client("route53", iamrole, aws_account)
-            for zone in route53_client.list_hosted_zones()["HostedZones"]:
-                infradata.append([aws_account, "hostedzone", zone_key(zone["Name"])])
+            # Account-global services (Route53, S3, CloudFront) — collect once, not per region.
+            _collect_global_infra(aws_account, iamrole, infradata)
 
             ec2_client = _create_client("ec2", iamrole, aws_account)
             regions = [
@@ -148,9 +153,6 @@ def _assume_role(aws_account, iamrole):
     return assume_role_response["Credentials"]
 
 
-_DEFAULT_REGION = "us-east-1"
-
-
 def _create_client(service, iamrole, aws_account=None, region=None):
     """Create a boto3 client, using a named CLI profile or assumed role."""
     kwargs = {}
@@ -172,13 +174,33 @@ def _create_client(service, iamrole, aws_account=None, region=None):
     return boto3.client(service, **kwargs)
 
 
+def _collect_global_infra(aws_account, iamrole, infradata):
+    """Collect account-global resources (Route53 zones, S3, CloudFront) once per account."""
+
+    # Hosted zone names — the "live zones" a delegated NS record is matched against.
+    route53_client = _create_client("route53", iamrole, aws_account)
+    for zone in _paginate(route53_client, "list_hosted_zones", "HostedZones"):
+        infradata.append([aws_account, "hostedzone", zone_key(zone["Name"])])
+
+    # S3 Buckets (global)
+    s3_client = _create_client("s3", iamrole, aws_account)
+    for bucket in s3_client.list_buckets()["Buckets"]:
+        infradata.append([aws_account, "s3", bucket["Name"]])
+
+    # CloudFront Distributions (global) — DistributionList is a dict, not a list,
+    # so iterate paginator pages directly rather than via _paginate.
+    cloudfront_client = _create_client("cloudfront", iamrole, aws_account)
+    for page in cloudfront_client.get_paginator("list_distributions").paginate():
+        for dist in page.get("DistributionList", {}).get("Items", []):
+            infradata.append([aws_account, "cloudfront", dist["DomainName"]])
+
+
 def _collect_region_infra(aws_account, iamrole, region, infradata):
     """Collect infrastructure data from a specific region."""
 
     # EC2 Instances
     ec2_client = _create_client("ec2", iamrole, aws_account, region)
-    reservations = ec2_client.describe_instances()["Reservations"]
-    for reservation in reservations:
+    for reservation in _paginate(ec2_client, "describe_instances", "Reservations"):
         for instance in reservation["Instances"]:
             for network_interface in instance["NetworkInterfaces"]:
                 association = network_interface.get("Association")
@@ -190,13 +212,13 @@ def _collect_region_infra(aws_account, iamrole, region, infradata):
 
     # Classic Load Balancers
     elb_client = _create_client("elb", iamrole, aws_account, region)
-    for lb in elb_client.describe_load_balancers()["LoadBalancerDescriptions"]:
+    for lb in _paginate(elb_client, "describe_load_balancers", "LoadBalancerDescriptions"):
         if lb["Scheme"] == "internet-facing":
             infradata.append([aws_account, "elb", lb["DNSName"]])
 
     # Application/Network Load Balancers
     elbv2_client = _create_client("elbv2", iamrole, aws_account, region)
-    for lb in elbv2_client.describe_load_balancers()["LoadBalancers"]:
+    for lb in _paginate(elbv2_client, "describe_load_balancers", "LoadBalancers"):
         if lb["Scheme"] == "internet-facing":
             infradata.append([aws_account, "elbv2", lb["DNSName"]])
 
@@ -210,22 +232,9 @@ def _collect_region_infra(aws_account, iamrole, region, infradata):
             infradata.append([aws_account, "elasticbeanstalk", env["EndpointURL"]])
             infradata.append([aws_account, "elasticbeanstalk", env["CNAME"]])
 
-    # CloudFront Distributions
-    cloudfront_client = _create_client("cloudfront", iamrole, aws_account, region)
-    distributions = cloudfront_client.list_distributions()
-    dist_list = distributions.get("DistributionList", {})
-    if dist_list and "Items" in dist_list:
-        for dist in dist_list["Items"]:
-            infradata.append([aws_account, "cloudfront", dist["DomainName"]])
-
-    # S3 Buckets
-    s3_client = _create_client("s3", iamrole, aws_account, region)
-    for bucket in s3_client.list_buckets()["Buckets"]:
-        infradata.append([aws_account, "s3", bucket["Name"]])
-
     # RDS Instances
     rds_client = _create_client("rds", iamrole, aws_account, region)
-    for db in rds_client.describe_db_instances()["DBInstances"]:
+    for db in _paginate(rds_client, "describe_db_instances", "DBInstances"):
         endpoint = db.get("Endpoint")
         if endpoint:
             infradata.append([aws_account, "rds", endpoint["Address"]])
@@ -245,10 +254,16 @@ def _collect_region_infra(aws_account, iamrole, region, infradata):
             if endpoint:
                 infradata.append([aws_account, "opensearch", endpoint])
 
-    # API Gateway
+    # API Gateway (v2) — manual NextToken pagination (no boto3 paginator)
     apigateway_client = _create_client("apigatewayv2", iamrole, aws_account, region)
-    apis = apigateway_client.get_apis()
-    for api in apis.get("Items", []):
-        api_endpoint = api.get("ApiEndpoint")
-        if api_endpoint:
-            infradata.append([aws_account, "apigateway", api_endpoint])
+    next_token = None
+    while True:
+        kwargs = {"NextToken": next_token} if next_token else {}
+        apis = apigateway_client.get_apis(**kwargs)
+        for api in apis.get("Items", []):
+            api_endpoint = api.get("ApiEndpoint")
+            if api_endpoint:
+                infradata.append([aws_account, "apigateway", api_endpoint])
+        next_token = apis.get("NextToken")
+        if not next_token:
+            break

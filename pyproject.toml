@@ -1,7 +1,7 @@
 [project]
 name = "findmytakeover"
 version = "1.0.0"
-description = "Detect dangling DNS records vulnerable to subdomain takeover across AWS, GCP, and Azure."
+description = "Detect dangling DNS records vulnerable to subdomain takeover across AWS, GCP, Azure, Cloudflare, and Oracle Cloud."
 readme = "README.md"
 license = { file = "LICENSE" }
 requires-python = ">=3.11"
@@ -33,6 +33,8 @@ dependencies = [
     "azure-mgmt-containerregistry==15.0.0",
     "azure-mgmt-redis==14.5.0",
     "azure-mgmt-sql==3.0.1",
+    "cloudflare==5.5.0",
+    "oci==2.182.0",
 ]
 
 [project.scripts]
