@@ -2,13 +2,24 @@
 """Self-check for dangling NS-delegation and Azure ALIAS detection.
 
 Runs the real diff engine (findmytakeover._find_dangling_records) over synthetic
-inventories — no cloud calls. Run: python3 test_dangling.py
+inventories — no cloud calls. Run: python3 tests/test_dangling.py
 """
+
+import os
+import sys
+
+# Make the repo root importable regardless of where the test is run from.
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import pandas as pd
 
 from collector import is_cloud_nameserver, zone_key
-from findmytakeover import _find_dangling_records, _parse_providers
+from findmytakeover import (
+    _find_dangling_records,
+    _parse_providers,
+    _is_internal_record,
+    _classify_target,
+)
 
 RECORD_COLS = ["csp", "account", "dnskey", "dnsvalue"]
 INFRA_COLS = ["csp", "account", "service", "value"]
@@ -61,9 +72,30 @@ def test_empty_provider_block():
     assert _parse_providers({"dns": {"aws": {"enabled": False}}}, "dns") == {}
 
 
+def test_internal_record_filter():
+    # Internal / private → hidden
+    assert _is_internal_record("kube-dns.kube-system.svc.cluster.local", "10.8.0.10")
+    assert _is_internal_record("orchestrator.myapp.svc.cluster.local", "34.118.224.1")  # public-range GKE svc IP
+    assert _is_internal_record("host.dev.cloud.example.com.", "10.0.204.170")
+    # Real public takeover targets → shown
+    assert not _is_internal_record("app.example.com.", "d1odiojnqoo3w8.cloudfront.net.")
+    assert not _is_internal_record("auth.example.com.", "198.202.211.1")
+
+
+def test_classify_target():
+    assert _classify_target("my-lb-1234567890.us-east-1.elb.amazonaws.com.") == "Amazon Web Services"
+    assert _classify_target("d1odiojnqoo3w8.cloudfront.net.") == "Amazon Web Services"
+    assert _classify_target("55c02fa8.4.us-west1.authorize.certificatemanager.goog.") == "Google Cloud Platform"
+    assert _classify_target("app.trafficmanager.net") == "Microsoft Azure"
+    assert _classify_target("statuspage.betteruptime.com") == "External"
+    assert _classify_target("198.202.211.1") == "External"
+
+
 if __name__ == "__main__":
     test_helpers()
     test_dangling_ns_delegation()
     test_azure_alias()
     test_empty_provider_block()
+    test_internal_record_filter()
+    test_classify_target()
     print("ok")
