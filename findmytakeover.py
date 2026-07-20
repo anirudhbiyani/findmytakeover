@@ -10,13 +10,15 @@ import pandas as pd
 import yaml
 
 # Supported cloud providers
-_SUPPORTED_PROVIDERS = frozenset(("aws", "gcp", "azure"))
+_SUPPORTED_PROVIDERS = frozenset(("aws", "gcp", "azure", "cloudflare", "oracle"))
 
 # Provider display names
 _PROVIDER_NAMES = {
     "aws": "Amazon Web Services",
     "gcp": "Google Cloud Platform",
     "azure": "Microsoft Azure",
+    "cloudflare": "Cloudflare",
+    "oracle": "Oracle Cloud Infrastructure",
 }
 
 CLI_PROMPT = r"""        
@@ -95,14 +97,20 @@ def _parse_providers(config, section):
 
     try:
         for provider_name, provider_config in config[section].items():
-            if not provider_config.get("enabled"):
+            # An empty provider block (e.g. "aws:" with nothing under it) parses
+            # as None — treat it as disabled rather than crashing on .get().
+            if not provider_config or not provider_config.get("enabled"):
                 continue
 
             credentials = provider_config.get("credentials")
             accounts = provider_config.get("accounts")
 
-            if credentials is None or accounts is None:
-                raise KeyError(f"Missing credentials or accounts for {provider_name}")
+            if credentials is None:
+                raise KeyError(f"Missing credentials for {provider_name}")
+
+            use_default = isinstance(credentials, str) and credentials.strip().lower() == "default"
+            if not use_default and not accounts:
+                raise KeyError(f"Missing accounts for {provider_name} (required when not using 'default' credentials)")
 
             providers[provider_name] = {
                 "credentials": credentials,
@@ -131,10 +139,13 @@ def _collect_dns_records(dns_config):
         collector = _get_collector(provider)
 
         data = collector.dns(config["accounts"], config["credentials"])
-        records.extend(
+        provider_records = [
             [provider_name, item[0], item[1], item[2]] for item in data
-        )
+        ]
+        click.echo(f"Collected {len(provider_records)} DNS record(s) from {provider_name}")
+        records.extend(provider_records)
 
+    click.echo(f"Total DNS records collected: {len(records)}")
     return records
 
 
@@ -153,10 +164,13 @@ def _collect_infrastructure(infra_config):
         collector = _get_collector(provider)
 
         data = collector.infra(config["accounts"], config["credentials"])
-        infrastructure.extend(
+        provider_infra = [
             [provider_name, item[0], item[1], item[2]] for item in data
-        )
+        ]
+        click.echo(f"Collected {len(provider_infra)} infrastructure resource(s) from {provider_name}")
+        infrastructure.extend(provider_infra)
 
+    click.echo(f"Total infrastructure resources collected: {len(infrastructure)}")
     return infrastructure
 
 
@@ -171,6 +185,63 @@ def _get_collector(provider):
     elif provider == "azure":
         from collector.msazure import azure
         return azure
+    elif provider == "cloudflare":
+        from collector.cloudflare import cloudflare
+        return cloudflare
+    elif provider == "oracle":
+        from collector.oracle import oracle
+        return oracle
+
+
+_INTERNAL_SUFFIXES = (".svc.cluster.local", ".local", ".internal")
+
+
+def _is_internal_record(name, value):
+    """True for records that can't be a public takeover target: internal DNS
+    names (K8s cluster DNS etc.) or values that are private/reserved IPs."""
+    if str(name).rstrip(".").lower().endswith(_INTERNAL_SUFFIXES):
+        return True
+    try:
+        ip = ipaddress.ip_address(str(value).rstrip("."))
+    except ValueError:
+        return False
+    return ip.is_private or ip.is_reserved or ip.is_loopback or ip.is_link_local
+
+
+# Signatures that map a DNS record's target (value) to the provider that owns it.
+_TARGET_SIGNATURES = (
+    ("Amazon Web Services", (
+        "amazonaws.com", "cloudfront.net", "acm-validations.aws",
+        "awsdns", "awsglobalaccelerator.com", "elasticbeanstalk.com",
+    )),
+    ("Microsoft Azure", (
+        "azure.com", "azure-dns.", "azurewebsites.net", "trafficmanager.net",
+        "azurefd.net", "azureedge.net", "cloudapp.azure.com", "core.windows.net",
+        "azurecr.io", "search.windows.net", "cache.windows.net",
+        "database.windows.net", "azurestaticapps.net", "azurecontainerapps.io",
+    )),
+    ("Google Cloud Platform", (
+        "googleapis.com", "googledomains.com", "appspot.com", "run.app",
+        "cloudfunctions.net", ".goog", "googleusercontent.com",
+    )),
+)
+
+# Print order for the grouped report.
+_TARGET_ORDER = (
+    "Amazon Web Services",
+    "Microsoft Azure",
+    "Google Cloud Platform",
+    "External",
+)
+
+
+def _classify_target(value):
+    """Which provider owns the resource a record points at (External = SaaS/third-party or a bare IP)."""
+    v = str(value).rstrip(".").lower()
+    for label, needles in _TARGET_SIGNATURES:
+        if any(n in v for n in needles):
+            return label
+    return "External"
 
 
 def _find_dangling_records(records_df, infrastructure_df, exclusions):
@@ -244,22 +315,44 @@ def main():
 
     result = _find_dangling_records(records_df, infrastructure_df, exclusions)
 
-    # Report dangling records
-    dangling_count = 0
+    # Group dangling records by the provider that owns the target resource,
+    # hiding internal/private ones (not takeover risks).
+    grouped = {label: [] for label in _TARGET_ORDER}
+    hidden_internal = 0
     for idx in result.index:
-        if result.loc[idx, "value"] == "":
-            dangling_count += 1
-            click.echo(
-                f"Found dangling DNS record - {result.loc[idx, 'dnskey']} "
-                f"with value {result.loc[idx, 'dnsvalue']} "
-                f"in {result.loc[idx, 'csp_x']} cloud "
-                f"(account/subscription/project: {result.loc[idx, 'account_x']})"
-            )
+        if result.loc[idx, "value"] != "":
+            continue
 
+        name = result.loc[idx, "dnskey"]
+        value = result.loc[idx, "dnsvalue"]
+        if _is_internal_record(name, value):
+            hidden_internal += 1
+            continue
+
+        grouped[_classify_target(value)].append(
+            f"  {name} -> {value} "
+            f"[{result.loc[idx, 'csp_x']} zone, account/subscription/project: {result.loc[idx, 'account_x']}]"
+        )
+
+    dangling_count = sum(len(v) for v in grouped.values())
     if dangling_count == 0:
         click.echo("No dangling DNS records found!")
     else:
+        for label in _TARGET_ORDER:
+            entries = grouped[label]
+            if not entries:
+                continue
+            heading = label + (" / third-party (SaaS, bare IPs)" if label == "External" else "")
+            click.echo(f"\n=== Targets on {heading} ({len(entries)}) ===")
+            for line in entries:
+                click.echo(line)
         click.echo(f"\nTotal dangling DNS records found: {dangling_count}")
+
+    if hidden_internal:
+        click.echo(
+            f"\n({hidden_internal} record(s) pointing at private/internal addresses "
+            "hidden \u2014 not takeover risks; use the dump file to see them)"
+        )
 
 
 if __name__ == "__main__":

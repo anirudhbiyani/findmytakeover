@@ -1,0 +1,10 @@
+{
+  "name": "findmytakeover",
+  "version": "1.0.0",
+  "description": "Detect dangling DNS records and subdomain-takeover risks across AWS, GCP, and Azure by driving the findmytakeover tool.",
+  "author": {
+    "name": "Anirudh Biyani",
+    "url": "https://github.com/anirudhbiyani"
+  },
+  "homepage": "https://github.com/anirudhbiyani/findmytakeover"
+}

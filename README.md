@@ -17,7 +17,7 @@ There are depencies that are required to be installed based on the cloud provide
 ```
 git clone https://github.com/anirudhbiyani/findmytakeover.git
 cd findmytakeover/
-pip3 install -r requirements.txt
+pip3 install .
 ```
 
 ## Dependencies
@@ -25,6 +25,8 @@ Depending on the cloud provider, you would need permission read data. The follow
   - Amazon Web Services - ViewOnlyRole and SecurityAudit
   - Microsoft Azure - Reader
   - Google Cloud - Viewer
+  - Cloudflare - API token with Zone:Read, DNS:Read, Account:Read, Pages:Read
+  - Oracle Cloud (OCI) - a group with `inspect`/`read` on dns, instances, load-balancers, and object-storage
 
 ## Usage
 ```
@@ -102,10 +104,16 @@ infra:
 ```
 
 ## Claude skill
-A [Claude Code](https://docs.claude.com/en/docs/claude-code) skill is bundled under [`skills/dangling-dns-finder`](skills/dangling-dns-finder). It lets you run a dangling-DNS / subdomain-takeover audit conversationally ("find dangling domains in `example.com`") against a Route53 zone, with NXDOMAIN checks verified across multiple resolvers, cloud-inventory cross-referencing, HTTP liveness confirmation, and a ready-to-review Route53 delete batch. See its [SKILL.md](skills/dangling-dns-finder/SKILL.md) for usage.
+A [Claude Code](https://docs.claude.com/en/docs/claude-code) skill is bundled under [`skills/dangling-dns-finder`](skills/dangling-dns-finder). It lets you run a dangling-DNS / subdomain-takeover audit conversationally ("find dangling domains across my AWS and GCP accounts") by driving `findmytakeover.py` itself — configuring providers, running the scan, interpreting the results, and showing (not running) the deletion commands. See its [SKILL.md](skills/dangling-dns-finder/SKILL.md) for usage.
+
+This repo is also a Claude Code plugin marketplace, so the skill can be installed with `/plugin`:
+```
+/plugin marketplace add anirudhbiyani/findmytakeover
+/plugin install findmytakeover@findmytakeover
+```
 
 ## Limtitations 
-This tools cannot guarantee 100% protection against subdomain takeovers. This will not protect you from dangling NS designations at the moment.
+This tools cannot guarantee 100% protection against subdomain takeovers. Dangling NS delegations are detected only when they point at a cloud-provider nameserver pool (AWS/Azure/GCP) — delegations to other DNS providers can't be judged from cloud inventory alone.
 
 ## Contributing
 
