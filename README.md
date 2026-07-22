@@ -115,6 +115,12 @@ This repo is also a Claude Code plugin marketplace, so the skill can be installe
 ## Limtitations 
 This tools cannot guarantee 100% protection against subdomain takeovers. Dangling NS delegations are detected only when they point at a cloud-provider nameserver pool (AWS/Azure/GCP) — delegations to other DNS providers can't be judged from cloud inventory alone.
 
+## Releasing
+
+Releases are tag-free: bump `version` in `pyproject.toml` and merge to `main` to
+publish a GA release to PyPI; open PRs auto-publish `.dev` builds to TestPyPI. See
+[PUBLISHING.md](PUBLISHING.md) for the flow and one-time trusted-publisher setup.
+
 ## Contributing
 
 You can contribute to the project in many ways either by reporting bugs, writting documentation, or adding code.

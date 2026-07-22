@@ -1,0 +1,32 @@
+# VCS / CI
+.git
+.github
+.gitignore
+.dockerignore
+
+# Python build/cache artifacts
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.pytest_cache/
+.mypy_cache/
+
+# Virtualenvs
+.venv
+venv/
+env/
+ENV/
+
+# Secrets / local config / scan output — must never enter the image
+.env
+findmytakeover.config
+scan-dump.csv
+*.csv
+*.log
+
+# Docs / assets not needed at runtime
+docs/
+tests/
+findmytakeover.jpg

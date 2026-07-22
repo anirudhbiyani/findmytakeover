@@ -1,0 +1,44 @@
+name: Docker
+
+# Build (and smoke-test) the image whenever anything that affects it changes.
+on:
+  push:
+    branches: [main]
+    paths: &img_paths
+      - "Dockerfile"
+      - ".dockerignore"
+      - "pyproject.toml"
+      - "findmytakeover.py"
+      - "collector/**"
+      - ".github/workflows/docker.yml"
+  pull_request:
+    paths: *img_paths
+
+concurrency:
+  group: docker-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Read version from pyproject.toml
+        id: ver
+        run: |
+          version=$(python3 -c "import tomllib; print(tomllib.load(open('pyproject.toml','rb'))['project']['version'])")
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "Image tag: findmytakeover:$version"
+
+      - name: Build image
+        run: docker build -t "findmytakeover:${{ steps.ver.outputs.version }}" .
+
+      - name: Smoke test — entrypoint runs
+        run: docker run --rm "findmytakeover:${{ steps.ver.outputs.version }}" --help
+
+      - name: Smoke test — every cloud collector imports inside distroless
+        run: >-
+          docker run --rm --entrypoint /usr/bin/python3
+          "findmytakeover:${{ steps.ver.outputs.version }}"
+          -c "import findmytakeover, collector.aws, collector.gcp, collector.msazure, collector.cloudflare, collector.oracle; print('imports ok')"
