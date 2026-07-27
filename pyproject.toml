@@ -17,7 +17,7 @@ dependencies = [
     "google-cloud-resource-manager==1.17.0",
     "google-cloud-storage==3.10.1",
     "google-cloud-compute==1.47.0",
-    "google-cloud-functions==1.23.0",
+    "google-cloud-functions==1.24.0",
     "azure-mgmt-dns==9.0.0",
     "azure-identity==1.25.3",
     "azure-mgmt-resource==25.0.0",
