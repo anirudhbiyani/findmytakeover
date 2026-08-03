@@ -36,6 +36,11 @@ dependencies = [
     "cloudflare==5.5.0",
     "oci==2.182.0",
     "dnspython==2.8.0",
+    "google-cloud-run==0.16.1",
+    "google-cloud-appengine-admin==1.18.0",
+    "google-cloud-container==2.65.0",
+    "google-cloud-artifact-registry==1.22.0",
+    "requests==2.34.2",
 ]
 
 [project.scripts]
