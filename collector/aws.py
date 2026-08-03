@@ -5,6 +5,7 @@ from functools import lru_cache
 
 import boto3
 import click
+from botocore.exceptions import ClientError, EndpointConnectionError
 
 from collector import is_cloud_nameserver, zone_key, MAX_WORKERS
 
@@ -14,6 +15,15 @@ _RELEVANT_RECORD_TYPES = frozenset(("A", "AAAA", "CNAME"))
 _USE_CLI_CREDS = "default"
 _DEFAULT_REGION = "us-east-1"
 
+# Global Accelerator has no regional control plane — its API is only served
+# out of us-west-2, regardless of where the accelerator's endpoints live.
+_GLOBALACCELERATOR_REGION = "us-west-2"
+
+# Errors raised when a service is unavailable, unauthorized, or not opted-into
+# in a given account/region. New per-service blocks catch these so one
+# unavailable service doesn't abort collection of the others.
+_SKIPPABLE_ERRORS = (ClientError, EndpointConnectionError)
+
 
 def _paginate(client, method, result_key, **kwargs):
     """Yield every item across all pages, using a boto3 paginator when one exists."""
@@ -22,6 +32,13 @@ def _paginate(client, method, result_key, **kwargs):
             yield from page.get(result_key, [])
     else:
         yield from getattr(client, method)(**kwargs).get(result_key, [])
+
+
+def _strip_url(value):
+    """Strip scheme and any trailing path/slash, leaving a bare DNS-matchable hostname."""
+    if not value:
+        return value
+    return value.removeprefix("https://").removeprefix("http://").split("/")[0]
 
 
 class aws:
@@ -203,6 +220,22 @@ def _collect_global_infra(aws_account, iamrole, infradata):
         for dist in page.get("DistributionList", {}).get("Items", []):
             infradata.append([aws_account, "cloudfront", dist["DomainName"]])
 
+    # Global Accelerator (global) — control plane only exists in us-west-2.
+    try:
+        globalaccelerator_client = _create_client(
+            "globalaccelerator", iamrole, aws_account, region=_GLOBALACCELERATOR_REGION
+        )
+        for accelerator in _paginate(
+            globalaccelerator_client, "list_accelerators", "Accelerators"
+        ):
+            dns_name = accelerator.get("DnsName")
+            if dns_name:
+                infradata.append(
+                    [aws_account, "globalaccelerator", _strip_url(dns_name)]
+                )
+    except _SKIPPABLE_ERRORS:
+        pass
+
 
 def _collect_region_infra(aws_account, iamrole, region):
     """Collect infrastructure data from a specific region (returns rows)."""
@@ -223,13 +256,16 @@ def _collect_region_infra(aws_account, iamrole, region):
         # Classic Load Balancers
         elb_client = _create_client("elb", iamrole, aws_account, region)
         for lb in _paginate(elb_client, "describe_load_balancers", "LoadBalancerDescriptions"):
-            if lb["Scheme"] == "internet-facing":
+            # Use .get() rather than [] — a malformed/edge-case LB entry
+            # missing "Scheme" would otherwise KeyError and abort every
+            # remaining service block for this region.
+            if lb.get("Scheme") == "internet-facing" and lb.get("DNSName"):
                 infradata.append([aws_account, "elb", lb["DNSName"]])
 
         # Application/Network Load Balancers
         elbv2_client = _create_client("elbv2", iamrole, aws_account, region)
         for lb in _paginate(elbv2_client, "describe_load_balancers", "LoadBalancers"):
-            if lb["Scheme"] == "internet-facing":
+            if lb.get("Scheme") == "internet-facing" and lb.get("DNSName"):
                 infradata.append([aws_account, "elbv2", lb["DNSName"]])
 
         # Elastic Beanstalk
@@ -277,6 +313,72 @@ def _collect_region_infra(aws_account, iamrole, region):
             if not next_token:
                 break
     except KeyError:
+        pass
+
+    # Lambda Function URLs — each new-style service block below is wrapped in
+    # its own try/except so an unavailable/unauthorized service only skips
+    # itself rather than aborting the rest of the region's collection.
+    try:
+        lambda_client = _create_client("lambda", iamrole, aws_account, region)
+        for function in _paginate(lambda_client, "list_functions", "Functions"):
+            function_name = function.get("FunctionName")
+            if not function_name:
+                continue
+            try:
+                url_config = lambda_client.get_function_url_config(
+                    FunctionName=function_name
+                )
+            except lambda_client.exceptions.ResourceNotFoundException:
+                # No Function URL configured for this function — not an error.
+                continue
+            function_url = url_config.get("FunctionUrl")
+            if function_url:
+                infradata.append([aws_account, "lambda-url", _strip_url(function_url)])
+    except _SKIPPABLE_ERRORS:
+        pass
+
+    # EKS Cluster Endpoints
+    try:
+        eks_client = _create_client("eks", iamrole, aws_account, region)
+        for cluster_name in _paginate(eks_client, "list_clusters", "clusters"):
+            cluster = eks_client.describe_cluster(name=cluster_name)["cluster"]
+            endpoint = cluster.get("endpoint")
+            if endpoint:
+                infradata.append([aws_account, "eks", _strip_url(endpoint)])
+    except _SKIPPABLE_ERRORS:
+        pass
+
+    # ECR Registries — repositoryUri is "<host>/<repo-name>"; only the host
+    # (the account/region's registry endpoint) is DNS-matchable.
+    try:
+        ecr_client = _create_client("ecr", iamrole, aws_account, region)
+        for repo in _paginate(ecr_client, "describe_repositories", "repositories"):
+            repository_uri = repo.get("repositoryUri")
+            if repository_uri:
+                infradata.append([aws_account, "ecr", _strip_url(repository_uri)])
+    except _SKIPPABLE_ERRORS:
+        pass
+
+    # Amplify Apps
+    try:
+        amplify_client = _create_client("amplify", iamrole, aws_account, region)
+        for app in _paginate(amplify_client, "list_apps", "apps"):
+            default_domain = app.get("defaultDomain")
+            if default_domain:
+                infradata.append([aws_account, "amplify", _strip_url(default_domain)])
+    except _SKIPPABLE_ERRORS:
+        pass
+
+    # App Runner Services
+    try:
+        apprunner_client = _create_client("apprunner", iamrole, aws_account, region)
+        for service in _paginate(
+            apprunner_client, "list_services", "ServiceSummaryList"
+        ):
+            service_url = service.get("ServiceUrl")
+            if service_url:
+                infradata.append([aws_account, "apprunner", _strip_url(service_url)])
+    except _SKIPPABLE_ERRORS:
         pass
 
     return infradata
