@@ -4,10 +4,27 @@ import argparse
 import ipaddress
 import os
 import sys
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import click
 import pandas as pd
 import yaml
+
+from collector import MAX_WORKERS
+from collector.fingerprints import identify_service
+
+# Passive DNS-resolution check (opt-out via --no-verify-dns). Optional
+# dependency: degrade gracefully if dnspython isn't installed.
+try:
+    import dns.resolver
+    _DNSPYTHON_AVAILABLE = True
+except ImportError:
+    _DNSPYTHON_AVAILABLE = False
+
+# Per-query timeout and total-per-lookup lifetime, in seconds. Kept short so a
+# blackholed/unreachable resolver can never hang the run.
+_DNS_QUERY_TIMEOUT = 2.0
+_DNS_LIFETIME = 5.0
 
 # Supported cloud providers
 _SUPPORTED_PROVIDERS = frozenset(("aws", "gcp", "azure", "cloudflare", "oracle"))
@@ -244,6 +261,64 @@ def _classify_target(value):
     return "External"
 
 
+def _make_resolver():
+    """Build a dnspython resolver with short, bounded timeouts so a slow or
+    blackholed name can never hang the run."""
+    resolver = dns.resolver.Resolver()
+    resolver.timeout = _DNS_QUERY_TIMEOUT
+    resolver.lifetime = _DNS_LIFETIME
+    return resolver
+
+
+def _resolve_hostname_status(resolver, hostname):
+    """Classify a hostname's DNS resolution as one of:
+
+      "nxdomain" - the name doesn't exist -- for a fingerprinted SaaS target
+                   this means the slot is free and the subdomain is likely
+                   claimable. High confidence.
+      "resolves" - the name still resolves (or exists but has no A record) --
+                   still occupied, not currently a finding.
+      "unknown"  - timeout, SERVFAIL, unreachable nameservers, or any other
+                   resolver error. Inconclusive -- never treat as a finding.
+    """
+    key = str(hostname).rstrip(".").lower()
+    try:
+        resolver.resolve(key, "A")
+        return "resolves"
+    except dns.resolver.NXDOMAIN:
+        return "nxdomain"
+    except dns.resolver.NoAnswer:
+        # The name exists (e.g. AAAA/CNAME only, no A record) -- not dangling.
+        return "resolves"
+    except Exception:
+        # dns.exception.Timeout, dns.resolver.NoNameservers, LifetimeTimeout,
+        # or anything else the resolver can throw -- treat as inconclusive
+        # rather than guessing.
+        return "unknown"
+
+
+def _verify_dns_targets(hostnames):
+    """Resolve each unique hostname at most once, in parallel, to confirm
+    whether a fingerprinted SaaS target is NXDOMAIN. Returns
+    {hostname: "nxdomain"|"resolves"|"unknown"}. Never raises; returns {} if
+    dnspython isn't available or there's nothing to check."""
+    if not _DNSPYTHON_AVAILABLE or not hostnames:
+        return {}
+
+    unique = sorted({str(h).rstrip(".").lower() for h in hostnames})
+    resolver = _make_resolver()
+    results = {}
+    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as pool:
+        futures = {pool.submit(_resolve_hostname_status, resolver, h): h for h in unique}
+        for future in as_completed(futures):
+            hostname = futures[future]
+            try:
+                results[hostname] = future.result()
+            except Exception:
+                results[hostname] = "unknown"
+    return results
+
+
 def _find_dangling_records(records_df, infrastructure_df, exclusions):
     """Find DNS records that don't have matching infrastructure."""
     result = pd.merge(
@@ -277,6 +352,18 @@ def main():
         "-d", "--dump-file",
         type=str,
         help="Path to save DNS and Infrastructure data",
+    )
+    parser.add_argument(
+        "--verify-dns",
+        dest="verify_dns",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "Resolve third-party SaaS targets that match a known takeover "
+            "fingerprint to confirm NXDOMAIN dangling records (requires the "
+            "dnspython package). Use --no-verify-dns to disable network "
+            "lookups entirely."
+        ),
     )
 
     args = parser.parse_args()
@@ -316,8 +403,10 @@ def main():
     result = _find_dangling_records(records_df, infrastructure_df, exclusions)
 
     # Group dangling records by the provider that owns the target resource,
-    # hiding internal/private ones (not takeover risks).
-    grouped = {label: [] for label in _TARGET_ORDER}
+    # hiding internal/private ones (not takeover risks). External (third-party)
+    # targets are set aside for SaaS fingerprinting below.
+    grouped = {label: [] for label in _TARGET_ORDER if label != "External"}
+    external_entries = []
     hidden_internal = 0
     for idx in result.index:
         if result.loc[idx, "value"] != "":
@@ -329,23 +418,88 @@ def main():
             hidden_internal += 1
             continue
 
-        grouped[_classify_target(value)].append(
+        line = (
             f"  {name} -> {value} "
             f"[{result.loc[idx, 'csp_x']} zone, account/subscription/project: {result.loc[idx, 'account_x']}]"
         )
+        label = _classify_target(value)
+        if label == "External":
+            external_entries.append({"value": value, "line": line, "service": identify_service(value)})
+        else:
+            grouped[label].append(line)
 
-    dangling_count = sum(len(v) for v in grouped.values())
+    # SaaS takeover fingerprinting + passive DNS confirmation, scoped to the
+    # External bucket. Only fingerprinted hostnames are resolved -- this is
+    # DNS-only (no HTTP) and NXDOMAIN is the only signal treated as a finding.
+    dns_status = {}
+    fingerprinted_hostnames = {e["value"] for e in external_entries if e["service"]}
+    if fingerprinted_hostnames:
+        if not args.verify_dns:
+            click.echo("\nDNS verification disabled (--no-verify-dns); skipping NXDOMAIN checks on fingerprinted SaaS targets.")
+        elif not _DNSPYTHON_AVAILABLE:
+            click.echo(
+                "\nDNS verification requested but the 'dnspython' package isn't installed "
+                "(pip install dnspython); skipping NXDOMAIN checks on fingerprinted SaaS targets."
+            )
+        else:
+            click.echo(f"\nResolving {len(fingerprinted_hostnames)} fingerprinted SaaS hostname(s) to check for NXDOMAIN...")
+            dns_status = _verify_dns_targets(fingerprinted_hostnames)
+
+    takeover_candidates = []  # (a) fingerprinted + confirmed NXDOMAIN
+    fingerprinted_unconfirmed = []  # (b) fingerprinted, still resolving or DNS status unknown
+    unclassified_external = []  # (c) no known SaaS fingerprint
+    for entry in external_entries:
+        service = entry["service"]
+        if not service:
+            unclassified_external.append(entry["line"])
+            continue
+
+        status = dns_status.get(str(entry["value"]).rstrip(".").lower())
+        if status == "nxdomain":
+            takeover_candidates.append(f"{entry['line']}  [{service} — NXDOMAIN, likely claimable]")
+        elif status == "resolves":
+            fingerprinted_unconfirmed.append(f"{entry['line']}  [{service} — still resolving]")
+        elif status == "unknown":
+            fingerprinted_unconfirmed.append(f"{entry['line']}  [{service} — DNS status unknown]")
+        else:
+            fingerprinted_unconfirmed.append(f"{entry['line']}  [{service} — DNS check skipped]")
+
+    dangling_count = (
+        sum(len(v) for v in grouped.values())
+        + len(takeover_candidates)
+        + len(fingerprinted_unconfirmed)
+        + len(unclassified_external)
+    )
+
     if dangling_count == 0:
         click.echo("No dangling DNS records found!")
     else:
         for label in _TARGET_ORDER:
+            if label == "External":
+                continue
             entries = grouped[label]
             if not entries:
                 continue
-            heading = label + (" / third-party (SaaS, bare IPs)" if label == "External" else "")
-            click.echo(f"\n=== Targets on {heading} ({len(entries)}) ===")
+            click.echo(f"\n=== Targets on {label} ({len(entries)}) ===")
             for line in entries:
                 click.echo(line)
+
+        external_total = len(takeover_candidates) + len(fingerprinted_unconfirmed) + len(unclassified_external)
+        if external_total:
+            click.echo(f"\n=== Targets on External / third-party (SaaS, bare IPs) ({external_total}) ===")
+            if takeover_candidates:
+                click.echo(f"\n  --- HIGH CONFIDENCE: fingerprinted SaaS target is NXDOMAIN ({len(takeover_candidates)}) ---")
+                for line in takeover_candidates:
+                    click.echo(line)
+            if fingerprinted_unconfirmed:
+                click.echo(f"\n  --- Fingerprinted SaaS target, not confirmed dangling ({len(fingerprinted_unconfirmed)}) ---")
+                for line in fingerprinted_unconfirmed:
+                    click.echo(line)
+            if unclassified_external:
+                click.echo(f"\n  --- Unclassified third-party target ({len(unclassified_external)}) ---")
+                for line in unclassified_external:
+                    click.echo(line)
+
         click.echo(f"\nTotal dangling DNS records found: {dangling_count}")
 
     if hidden_internal:
