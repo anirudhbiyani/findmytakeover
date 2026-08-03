@@ -38,8 +38,12 @@ def test_helpers():
     assert is_cloud_nameserver("ns-1.awsdns-01.org")
     assert is_cloud_nameserver("ns1-01.AZURE-DNS.com")
     assert is_cloud_nameserver("ns-cloud-a1.googledomains.com")
-    assert not is_cloud_nameserver("dana.ns.cloudflare.com")
+    # Cloudflare and OCI run inventoried managed-DNS pools too, so a delegation
+    # into either is judgeable — and takeover-prone once the zone is deleted.
+    assert is_cloud_nameserver("dana.ns.cloudflare.com")
+    assert is_cloud_nameserver("ns1.p68.dns.oraclecloud.net")
     assert not is_cloud_nameserver("ns1.registrar.example")
+    assert not is_cloud_nameserver("ns1.digitalocean.com")
     assert zone_key("Sub.Example.COM.") == "sub.example.com"
 
 
