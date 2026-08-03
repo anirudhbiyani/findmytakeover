@@ -308,7 +308,10 @@ def _collect_region_infra(aws_account, iamrole, region):
             for api in apis.get("Items", []):
                 api_endpoint = api.get("ApiEndpoint")
                 if api_endpoint:
-                    infradata.append([aws_account, "apigateway", api_endpoint])
+                    # ApiEndpoint comes back as https://{id}.execute-api.{region}.amazonaws.com;
+                    # stored raw it could never match a bare DNS value, so every
+                    # API-Gateway-backed record looked dangling.
+                    infradata.append([aws_account, "apigateway", _strip_url(api_endpoint)])
             next_token = apis.get("NextToken")
             if not next_token:
                 break
