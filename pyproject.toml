@@ -11,7 +11,7 @@ dependencies = [
     "click==8.4.1",
     "PyYAML==6.0.3",
     "pandas==3.0.3",
-    "boto3==1.43.14",
+    "boto3==1.43.61",
     "google-cloud-dns==0.37.0",
     "google-auth==2.53.0",
     "google-cloud-resource-manager==1.17.0",
