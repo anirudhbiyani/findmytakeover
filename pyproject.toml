@@ -35,6 +35,7 @@ dependencies = [
     "azure-mgmt-sql==4.0.0",
     "cloudflare==5.5.0",
     "oci==2.182.0",
+    "dnspython==2.8.0",
 ]
 
 [project.scripts]

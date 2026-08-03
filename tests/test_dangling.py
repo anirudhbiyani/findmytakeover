@@ -212,3 +212,57 @@ if __name__ == "__main__":
     test_resolve_hostname_status_classification()
     test_verify_dns_targets_dedupes_and_classifies()
     print("ok")
+
+
+def test_exclusions_ipv4_ipv6_and_domains():
+    ex = findmytakeover._parse_exclusions(
+        {"exclude": {"ipaddress": ["100.1.0.0/16", "2001:db8::/32"], "domains": ["example.com"]}}
+    )
+    # Networks are kept as networks, not expanded to 65k individual addresses.
+    assert len(ex.networks) == 2
+    assert ex.matches("100.1.2.3")
+    assert ex.matches("2001:db8::5")          # IPv6 used to raise AddressValueError
+    assert ex.matches("a.example.com")
+    assert not ex.matches("9.9.9.9")
+    assert not ex.matches("a.other.net")
+    # Absent / empty config is not an error.
+    assert not findmytakeover._parse_exclusions({})
+    assert not findmytakeover._parse_exclusions({"exclude": None})
+
+
+def test_find_dangling_accepts_legacy_exclusion_iterable():
+    records = [["aws", "1", "a.example.com", "8.8.8.8"], ["aws", "1", "b.example.com", "1.1.1.1"]]
+    infra = []
+    # A plain set of substrings (the pre-_Exclusions calling convention) still works.
+    assert _dangling_values(records, infra) == {"8.8.8.8", "1.1.1.1"}
+    result = _find_dangling_records(
+        pd.DataFrame(records, columns=RECORD_COLS),
+        pd.DataFrame(infra, columns=INFRA_COLS),
+        exclusions={"8.8.8.8"},
+    )
+    assert set(result["dnsvalue"]) == {"1.1.1.1"}
+
+
+def test_json_report_shape():
+    import json as _json
+    import tempfile
+
+    findings = [
+        {"record": "a.example.com", "target": "gone.github.io", "dns_provider": "aws",
+         "account": "111", "target_owner": "External", "saas_service": "GitHub Pages",
+         "dns_status": "nxdomain", "confidence": "high"},
+        {"record": "b.example.com", "target": "x.elb.amazonaws.com", "dns_provider": "aws",
+         "account": "111", "target_owner": "Amazon Web Services", "saas_service": None,
+         "dns_status": None, "confidence": "inventory-miss"},
+    ]
+    with tempfile.TemporaryDirectory() as d:
+        path = os.path.join(d, "report.json")
+        findmytakeover._write_json_report(path, findings, hidden_internal=3)
+        with open(path) as fh:
+            report = _json.load(fh)
+    assert report["tool"] == "findmytakeover"
+    assert report["summary"]["total"] == 2
+    assert report["summary"]["high_confidence"] == 1
+    assert report["summary"]["hidden_internal"] == 3
+    assert report["summary"]["by_target_owner"]["External"] == 1
+    assert len(report["findings"]) == 2
