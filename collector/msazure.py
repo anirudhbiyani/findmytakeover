@@ -3,7 +3,10 @@
 from azure.core.exceptions import HttpResponseError
 from azure.mgmt.dns import DnsManagementClient
 from azure.identity import ClientSecretCredential, DefaultAzureCredential
-from azure.mgmt.resource import ResourceManagementClient
+# Keep the submodule path: azure-mgmt-resource 26.x turned the parent into a
+# namespace package with no top-level re-export, so the short import breaks on
+# the next dependabot bump. This path works on both 25.x and 26.x.
+from azure.mgmt.resource.resources import ResourceManagementClient
 from azure.mgmt.subscription import SubscriptionClient
 from azure.mgmt.network import NetworkManagementClient
 from azure.mgmt.cdn import CdnManagementClient
