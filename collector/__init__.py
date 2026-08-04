@@ -10,9 +10,16 @@ MAX_WORKERS = max(1, int(os.environ.get("FINDMYTAKEOVER_MAX_WORKERS", "8")))
 
 # Nameserver suffixes for the managed-DNS pools where a deleted zone can be
 # re-registered by someone else — the dangling-NS-delegation takeover case. A
-# delegation to any other provider (registrar, Cloudflare, ...) is out of scope
-# here: we can't tell from inventory alone whether it's still live.
-_CLOUD_NS_SUFFIXES = ("awsdns", "azure-dns", "googledomains", "cloud.goog")
+# delegation to a provider we don't inventory (a registrar, another managed DNS
+# host) stays out of scope: we can't tell from inventory alone whether it's live.
+_CLOUD_NS_SUFFIXES = (
+    "awsdns",               # AWS Route 53
+    "azure-dns",            # Microsoft Azure DNS
+    "googledomains",        # Google Cloud DNS
+    "cloud.goog",           # Google Cloud DNS (alternate pool)
+    "ns.cloudflare.com",    # Cloudflare
+    "dns.oraclecloud.net",  # Oracle Cloud Infrastructure DNS
+)
 
 
 def is_cloud_nameserver(nsdname):
