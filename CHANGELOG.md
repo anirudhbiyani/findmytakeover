@@ -8,16 +8,12 @@ the project aims to follow [Semantic Versioning](https://semver.org/spec/v2.0.0.
 Entries for 1.x predate this file and were reconstructed from git history, so
 they summarise the shape of each release rather than listing every commit.
 
-## [2.0.0] — Unreleased
+## [2.0.0] — 2026-08-04
 
 Everything in this release landed in 2026. It roughly triples the tool's
 provider and resource coverage, adds a second detection technique beyond
 inventory diffing, and turns the project into something installable,
 containerised and CI-gateable.
-
-> `pyproject.toml` still declares `1.0.0`. Bumping it to `2.0.0` is what
-> actually cuts the release, because the publish workflow ships whatever
-> version `main` carries.
 
 ### Added
 

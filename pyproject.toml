@@ -1,6 +1,6 @@
 [project]
 name = "findmytakeover"
-version = "1.0.0"
+version = "2.0.0"
 description = "Detect dangling DNS records vulnerable to subdomain takeover across AWS, GCP, Azure, Cloudflare, and Oracle Cloud."
 readme = "README.md"
 license = { file = "LICENSE" }
