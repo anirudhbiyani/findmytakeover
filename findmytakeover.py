@@ -281,6 +281,11 @@ _TARGET_ORDER = (
 def _classify_target(value):
     """Which provider owns the resource a record points at (External = SaaS/third-party or a bare IP)."""
     v = str(value).rstrip(".").lower()
+    # Azure ALIAS records resolve to an ARM resource id rather than a hostname,
+    # so none of the hostname signatures below can match one. Without this an
+    # ALIAS finding is filed under third-party SaaS, which is plainly wrong.
+    if v.startswith("/subscriptions/") and "/providers/microsoft." in v:
+        return "Microsoft Azure"
     for label, needles in _TARGET_SIGNATURES:
         if any(n in v for n in needles):
             return label

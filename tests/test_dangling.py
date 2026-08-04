@@ -122,6 +122,13 @@ def test_classify_target():
     assert _classify_target("app.trafficmanager.net") == "Microsoft Azure"
     assert _classify_target("statuspage.betteruptime.com") == "External"
     assert _classify_target("198.202.211.1") == "External"
+    # Azure ALIAS records carry an ARM resource id, not a hostname. These must
+    # be attributed to Azure, not filed under third-party SaaS.
+    arm = "/subscriptions/1111/resourcegroups/rg/providers/microsoft.network/publicipaddresses/pip"
+    assert _classify_target(arm) == "Microsoft Azure"
+    assert _classify_target(arm.upper()) == "Microsoft Azure"
+    # A path-looking value that isn't an ARM id stays External.
+    assert _classify_target("/subscriptions/1111/something/else") == "External"
 
 
 def test_identify_service():
