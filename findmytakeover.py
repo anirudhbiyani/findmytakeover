@@ -2,12 +2,30 @@
 
 import argparse
 import ipaddress
+import json
 import os
 import sys
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import click
 import pandas as pd
 import yaml
+
+from collector import MAX_WORKERS
+from collector.fingerprints import identify_service
+
+# Passive DNS-resolution check (opt-out via --no-verify-dns). Optional
+# dependency: degrade gracefully if dnspython isn't installed.
+try:
+    import dns.resolver
+    _DNSPYTHON_AVAILABLE = True
+except ImportError:
+    _DNSPYTHON_AVAILABLE = False
+
+# Per-query timeout and total-per-lookup lifetime, in seconds. Kept short so a
+# blackholed/unreachable resolver can never hang the run.
+_DNS_QUERY_TIMEOUT = 2.0
+_DNS_LIFETIME = 5.0
 
 # Supported cloud providers
 _SUPPORTED_PROVIDERS = frozenset(("aws", "gcp", "azure", "cloudflare", "oracle"))
@@ -61,30 +79,55 @@ def read_config(config_path):
     return dns_providers, infra_providers, exclude
 
 
+class _Exclusions:
+    """Exclusion rules from config: IP networks matched by containment, domains
+    matched as substrings.
+
+    Networks are kept as networks rather than expanded to individual addresses —
+    expanding even the README's own 100.1.0.0/16 example produced 65,536 entries,
+    each of which then cost a separate full scan of the results frame.
+    """
+
+    def __init__(self, networks=(), domains=()):
+        self.networks = list(networks)
+        self.domains = {str(d) for d in domains}
+
+    def __bool__(self):
+        return bool(self.networks or self.domains)
+
+    def matches(self, value):
+        """True if this DNS value is excluded."""
+        text = str(value).rstrip(".")
+        if self.networks:
+            try:
+                address = ipaddress.ip_address(text)
+            except ValueError:
+                pass
+            else:
+                return any(address in network for network in self.networks)
+        return any(domain in text for domain in self.domains)
+
+
 def _parse_exclusions(config):
     """Parse exclusion rules from config."""
-    exclude = set()
-
     if "exclude" not in config:
-        return exclude
+        return _Exclusions()
 
     try:
-        exclude_config = config["exclude"]
+        exclude_config = config["exclude"] or {}
 
-        # Expand IP networks to individual addresses
-        for ip_network in exclude_config.get("ipaddress", []):
-            for ip in ipaddress.IPv4Network(ip_network):
-                exclude.add(str(ip))
-
-        # Add domain exclusions
-        for domain in exclude_config.get("domains", []):
-            exclude.add(str(domain))
+        # Accepts IPv4 and IPv6 CIDRs alike; ip_network picks the right family.
+        networks = [
+            ipaddress.ip_network(str(entry), strict=False)
+            for entry in exclude_config.get("ipaddress", []) or []
+        ]
+        domains = exclude_config.get("domains", []) or []
 
     except (KeyError, ValueError) as e:
         click.echo(f"Invalid exclusion configuration: {e}")
         sys.exit(1)
 
-    return exclude
+    return _Exclusions(networks, domains)
 
 
 def _parse_providers(config, section):
@@ -244,6 +287,64 @@ def _classify_target(value):
     return "External"
 
 
+def _make_resolver():
+    """Build a dnspython resolver with short, bounded timeouts so a slow or
+    blackholed name can never hang the run."""
+    resolver = dns.resolver.Resolver()
+    resolver.timeout = _DNS_QUERY_TIMEOUT
+    resolver.lifetime = _DNS_LIFETIME
+    return resolver
+
+
+def _resolve_hostname_status(resolver, hostname):
+    """Classify a hostname's DNS resolution as one of:
+
+      "nxdomain" - the name doesn't exist -- for a fingerprinted SaaS target
+                   this means the slot is free and the subdomain is likely
+                   claimable. High confidence.
+      "resolves" - the name still resolves (or exists but has no A record) --
+                   still occupied, not currently a finding.
+      "unknown"  - timeout, SERVFAIL, unreachable nameservers, or any other
+                   resolver error. Inconclusive -- never treat as a finding.
+    """
+    key = str(hostname).rstrip(".").lower()
+    try:
+        resolver.resolve(key, "A")
+        return "resolves"
+    except dns.resolver.NXDOMAIN:
+        return "nxdomain"
+    except dns.resolver.NoAnswer:
+        # The name exists (e.g. AAAA/CNAME only, no A record) -- not dangling.
+        return "resolves"
+    except Exception:
+        # dns.exception.Timeout, dns.resolver.NoNameservers, LifetimeTimeout,
+        # or anything else the resolver can throw -- treat as inconclusive
+        # rather than guessing.
+        return "unknown"
+
+
+def _verify_dns_targets(hostnames):
+    """Resolve each unique hostname at most once, in parallel, to confirm
+    whether a fingerprinted SaaS target is NXDOMAIN. Returns
+    {hostname: "nxdomain"|"resolves"|"unknown"}. Never raises; returns {} if
+    dnspython isn't available or there's nothing to check."""
+    if not _DNSPYTHON_AVAILABLE or not hostnames:
+        return {}
+
+    unique = sorted({str(h).rstrip(".").lower() for h in hostnames})
+    resolver = _make_resolver()
+    results = {}
+    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as pool:
+        futures = {pool.submit(_resolve_hostname_status, resolver, h): h for h in unique}
+        for future in as_completed(futures):
+            hostname = futures[future]
+            try:
+                results[hostname] = future.result()
+            except Exception:
+                results[hostname] = "unknown"
+    return results
+
+
 def _find_dangling_records(records_df, infrastructure_df, exclusions):
     """Find DNS records that don't have matching infrastructure."""
     result = pd.merge(
@@ -254,11 +355,34 @@ def _find_dangling_records(records_df, infrastructure_df, exclusions):
         how="left",
     ).fillna(value="")
 
-    # Apply exclusions
-    for exclusion in exclusions:
-        result = result[~result["dnsvalue"].str.contains(exclusion, na=False, regex=False)]
+    # Apply exclusions in a single vectorized pass. Accepts a plain iterable of
+    # substring patterns too, so callers (and tests) predating _Exclusions work.
+    if not isinstance(exclusions, _Exclusions):
+        exclusions = _Exclusions(domains=exclusions or ())
+    if exclusions:
+        result = result[~result["dnsvalue"].map(exclusions.matches)]
 
     return result
+
+
+def _version():
+    """Version of the installed package, falling back to pyproject.toml so the
+    flag still reports something useful when running from a source checkout."""
+    try:
+        from importlib.metadata import PackageNotFoundError, version
+
+        return version("findmytakeover")
+    except (ImportError, PackageNotFoundError):
+        pass
+
+    try:
+        import tomllib
+
+        pyproject = os.path.join(os.path.dirname(os.path.abspath(__file__)), "pyproject.toml")
+        with open(pyproject, "rb") as handle:
+            return tomllib.load(handle)["project"]["version"]
+    except (ImportError, OSError, KeyError):
+        return "unknown"
 
 
 def main():
@@ -278,6 +402,37 @@ def main():
         type=str,
         help="Path to save DNS and Infrastructure data",
     )
+    parser.add_argument(
+        "--verify-dns",
+        dest="verify_dns",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "Resolve third-party SaaS targets that match a known takeover "
+            "fingerprint to confirm NXDOMAIN dangling records (requires the "
+            "dnspython package). Use --no-verify-dns to disable network "
+            "lookups entirely."
+        ),
+    )
+    parser.add_argument(
+        "--json",
+        dest="json_file",
+        type=str,
+        help=(
+            "Write findings as JSON to this path, for feeding a SIEM, ticketing "
+            "system or dashboard. Use '-' for stdout."
+        ),
+    )
+    parser.add_argument(
+        "--fail-on-findings",
+        action="store_true",
+        help=(
+            "Exit with status 1 when dangling records are found, so a CI job or "
+            "scheduled scan fails instead of passing silently. Off by default so "
+            "existing scripts keep their exit codes."
+        ),
+    )
+    parser.add_argument("--version", action="version", version=f"findmytakeover {_version()}")
 
     args = parser.parse_args()
 
@@ -316,8 +471,11 @@ def main():
     result = _find_dangling_records(records_df, infrastructure_df, exclusions)
 
     # Group dangling records by the provider that owns the target resource,
-    # hiding internal/private ones (not takeover risks).
-    grouped = {label: [] for label in _TARGET_ORDER}
+    # hiding internal/private ones (not takeover risks). External (third-party)
+    # targets are set aside for SaaS fingerprinting below.
+    grouped = {label: [] for label in _TARGET_ORDER if label != "External"}
+    external_entries = []
+    findings = []
     hidden_internal = 0
     for idx in result.index:
         if result.loc[idx, "value"] != "":
@@ -329,23 +487,112 @@ def main():
             hidden_internal += 1
             continue
 
-        grouped[_classify_target(value)].append(
+        line = (
             f"  {name} -> {value} "
             f"[{result.loc[idx, 'csp_x']} zone, account/subscription/project: {result.loc[idx, 'account_x']}]"
         )
+        label = _classify_target(value)
 
-    dangling_count = sum(len(v) for v in grouped.values())
+        # One structured record per finding, shared with the JSON output. The
+        # External tiering below mutates these same dicts, so console and JSON
+        # can never disagree.
+        finding = {
+            "record": str(name).rstrip("."),
+            "target": str(value).rstrip("."),
+            "dns_provider": str(result.loc[idx, "csp_x"]),
+            "account": str(result.loc[idx, "account_x"]),
+            "target_owner": label,
+            "saas_service": None,
+            "dns_status": None,
+            "confidence": "inventory-miss",
+        }
+        findings.append(finding)
+
+        if label == "External":
+            finding["saas_service"] = identify_service(value)
+            external_entries.append({"value": value, "line": line, "finding": finding})
+        else:
+            grouped[label].append(line)
+
+    # SaaS takeover fingerprinting + passive DNS confirmation, scoped to the
+    # External bucket. Only fingerprinted hostnames are resolved -- this is
+    # DNS-only (no HTTP) and NXDOMAIN is the only signal treated as a finding.
+    dns_status = {}
+    fingerprinted_hostnames = {e["value"] for e in external_entries if e["finding"]["saas_service"]}
+    if fingerprinted_hostnames:
+        if not args.verify_dns:
+            click.echo("\nDNS verification disabled (--no-verify-dns); skipping NXDOMAIN checks on fingerprinted SaaS targets.")
+        elif not _DNSPYTHON_AVAILABLE:
+            click.echo(
+                "\nDNS verification requested but the 'dnspython' package isn't installed "
+                "(pip install dnspython); skipping NXDOMAIN checks on fingerprinted SaaS targets."
+            )
+        else:
+            click.echo(f"\nResolving {len(fingerprinted_hostnames)} fingerprinted SaaS hostname(s) to check for NXDOMAIN...")
+            dns_status = _verify_dns_targets(fingerprinted_hostnames)
+
+    takeover_candidates = []  # (a) fingerprinted + confirmed NXDOMAIN
+    fingerprinted_unconfirmed = []  # (b) fingerprinted, still resolving or DNS status unknown
+    unclassified_external = []  # (c) no known SaaS fingerprint
+    for entry in external_entries:
+        finding = entry["finding"]
+        service = finding["saas_service"]
+        if not service:
+            unclassified_external.append(entry["line"])
+            finding["confidence"] = "unclassified-third-party"
+            continue
+
+        status = dns_status.get(str(entry["value"]).rstrip(".").lower())
+        finding["dns_status"] = status
+        if status == "nxdomain":
+            takeover_candidates.append(f"{entry['line']}  [{service} — NXDOMAIN, likely claimable]")
+            finding["confidence"] = "high"
+        elif status == "resolves":
+            fingerprinted_unconfirmed.append(f"{entry['line']}  [{service} — still resolving]")
+            finding["confidence"] = "fingerprinted-still-resolving"
+        elif status == "unknown":
+            fingerprinted_unconfirmed.append(f"{entry['line']}  [{service} — DNS status unknown]")
+            finding["confidence"] = "fingerprinted-dns-unknown"
+        else:
+            fingerprinted_unconfirmed.append(f"{entry['line']}  [{service} — DNS check skipped]")
+            finding["confidence"] = "fingerprinted-unverified"
+
+    dangling_count = (
+        sum(len(v) for v in grouped.values())
+        + len(takeover_candidates)
+        + len(fingerprinted_unconfirmed)
+        + len(unclassified_external)
+    )
+
     if dangling_count == 0:
         click.echo("No dangling DNS records found!")
     else:
         for label in _TARGET_ORDER:
+            if label == "External":
+                continue
             entries = grouped[label]
             if not entries:
                 continue
-            heading = label + (" / third-party (SaaS, bare IPs)" if label == "External" else "")
-            click.echo(f"\n=== Targets on {heading} ({len(entries)}) ===")
+            click.echo(f"\n=== Targets on {label} ({len(entries)}) ===")
             for line in entries:
                 click.echo(line)
+
+        external_total = len(takeover_candidates) + len(fingerprinted_unconfirmed) + len(unclassified_external)
+        if external_total:
+            click.echo(f"\n=== Targets on External / third-party (SaaS, bare IPs) ({external_total}) ===")
+            if takeover_candidates:
+                click.echo(f"\n  --- HIGH CONFIDENCE: fingerprinted SaaS target is NXDOMAIN ({len(takeover_candidates)}) ---")
+                for line in takeover_candidates:
+                    click.echo(line)
+            if fingerprinted_unconfirmed:
+                click.echo(f"\n  --- Fingerprinted SaaS target, not confirmed dangling ({len(fingerprinted_unconfirmed)}) ---")
+                for line in fingerprinted_unconfirmed:
+                    click.echo(line)
+            if unclassified_external:
+                click.echo(f"\n  --- Unclassified third-party target ({len(unclassified_external)}) ---")
+                for line in unclassified_external:
+                    click.echo(line)
+
         click.echo(f"\nTotal dangling DNS records found: {dangling_count}")
 
     if hidden_internal:
@@ -353,6 +600,45 @@ def main():
             f"\n({hidden_internal} record(s) pointing at private/internal addresses "
             "hidden \u2014 not takeover risks; use the dump file to see them)"
         )
+
+    if args.json_file:
+        _write_json_report(args.json_file, findings, hidden_internal)
+
+    # Opt-in so a scheduled scan or CI job can fail on findings instead of
+    # passing silently. Default stays 0 to keep existing callers working.
+    if args.fail_on_findings and dangling_count:
+        sys.exit(1)
+
+
+def _write_json_report(path, findings, hidden_internal):
+    """Write findings as JSON to a path, or to stdout when path is '-'."""
+    report = {
+        "tool": "findmytakeover",
+        "version": _version(),
+        "summary": {
+            "total": len(findings),
+            "high_confidence": sum(1 for f in findings if f["confidence"] == "high"),
+            "hidden_internal": hidden_internal,
+            "by_target_owner": {
+                owner: sum(1 for f in findings if f["target_owner"] == owner)
+                for owner in sorted({f["target_owner"] for f in findings})
+            },
+        },
+        "findings": findings,
+    }
+
+    if path == "-":
+        click.echo(json.dumps(report, indent=2))
+        return
+
+    try:
+        with open(path, "w") as handle:
+            json.dump(report, handle, indent=2)
+    except OSError as e:
+        click.echo(f"Could not write JSON report to {path}: {e}")
+        sys.exit(1)
+
+    click.echo(f"\nJSON report written to {path} ({len(findings)} finding(s))")
 
 
 if __name__ == "__main__":

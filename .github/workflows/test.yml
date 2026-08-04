@@ -1,0 +1,67 @@
+name: Test
+
+# The tool talks to five cloud providers, so the thing most likely to break a
+# release is an import or packaging error, not the diff engine. This workflow
+# therefore does three things: install the package the way a user would, prove
+# every collector imports, and run the test suite.
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: test-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # Floor from pyproject's requires-python, the version the container
+        # image ships, and the newest release.
+        python-version: ["3.11", "3.13", "3.14"]
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install the package (doubles as a packaging smoke test)
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install .
+
+      - name: Every cloud collector imports
+        run: >-
+          python -c "import findmytakeover,
+          collector.aws, collector.gcp, collector.msazure,
+          collector.cloudflare, collector.oracle; print('imports ok')"
+
+      - name: CLI responds
+        run: findmytakeover --help
+
+      - name: Run tests
+        run: |
+          python -m pip install pytest
+          python -m pytest tests/ -v
+
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.14"
+
+      # Pyflakes rules only (unused imports, undefined names, f-string bugs).
+      # These are real defects; style/line-length rules are deliberately left
+      # out so lint failures always mean something is actually wrong.
+      - name: Ruff (pyflakes rules)
+        run: |
+          python -m pip install ruff
+          python -m ruff check --select F --exclude .claude .

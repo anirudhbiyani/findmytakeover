@@ -30,16 +30,53 @@ Depending on the cloud provider, you would need permission read data. The follow
 
 ## Usage
 ```
-# ./findmytakeover.py --help
-usage: findmytakeover.py [-h] [-c CONFIG_FILE] [-d DUMP_FILE]
+# findmytakeover --help
+usage: findmytakeover [-h] [-c CONFIG_FILE] [-d DUMP_FILE]
+                      [--verify-dns | --no-verify-dns] [--json JSON_FILE]
+                      [--fail-on-findings] [--version]
 
 options:
   -h, --help            show this help message and exit
-  -c CONFIG_FILE, --config-file CONFIG_FILE
-                        Enter the path to the configuration file that you want the tool to use.
-  -d DUMP_FILE, --dump-file DUMP_FILE
-                        Enter the path to where all the DNS and Infrastructre data would be saved.
+  -c, --config-file CONFIG_FILE
+                        Path to the configuration file
+  -d, --dump-file DUMP_FILE
+                        Path to save DNS and Infrastructure data
+  --verify-dns, --no-verify-dns
+                        Resolve third-party SaaS targets that match a known
+                        takeover fingerprint to confirm NXDOMAIN dangling
+                        records. Use --no-verify-dns to disable network
+                        lookups entirely.
+  --json JSON_FILE      Write findings as JSON to this path, for feeding a
+                        SIEM, ticketing system or dashboard. Use '-' for
+                        stdout.
+  --fail-on-findings    Exit with status 1 when dangling records are found, so
+                        a CI job or scheduled scan fails instead of passing
+                        silently.
+  --version             show program's version number and exit
 ```
+
+### Third-party SaaS takeover detection
+
+Beyond diffing DNS against cloud inventory, records pointing at a known
+takeover-prone SaaS provider (GitHub Pages, Heroku, Shopify, Netlify, Fastly,
+Zendesk and others) are fingerprinted, and the target hostname is resolved to
+confirm the finding. **NXDOMAIN means the hostname is gone and likely
+claimable** — those are reported as high confidence. A hostname that still
+resolves, or a lookup that times out, is never treated as a confirmed finding.
+
+This check is DNS-only — no HTTP requests are made. Disable network lookups
+entirely with `--no-verify-dns`.
+
+### Using it in CI
+
+```
+findmytakeover --json findings.json --fail-on-findings
+```
+
+`--fail-on-findings` makes the exit status 1 when anything is found, so a
+pipeline fails instead of passing silently. The JSON report carries a summary
+plus a `confidence` field per finding, so alerting can key on
+`confidence == "high"`.
 The default value of the configuiration file would be the same directory where the tool is located and the configuration file would look like this.
 
 
@@ -113,7 +150,7 @@ This repo is also a Claude Code plugin marketplace, so the skill can be installe
 ```
 
 ## Limtitations 
-This tools cannot guarantee 100% protection against subdomain takeovers. Dangling NS delegations are detected only when they point at a cloud-provider nameserver pool (AWS/Azure/GCP) — delegations to other DNS providers can't be judged from cloud inventory alone.
+This tools cannot guarantee 100% protection against subdomain takeovers. Dangling NS delegations are detected only when they point at a managed-DNS nameserver pool we inventory (AWS, Azure, GCP, Cloudflare, Oracle Cloud) — delegations to other DNS providers can't be judged from cloud inventory alone.
 
 ## Releasing
 

@@ -13,13 +13,42 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import pandas as pd
 
+import findmytakeover
 from collector import is_cloud_nameserver, zone_key
+from collector.fingerprints import identify_service
 from findmytakeover import (
+    _DNSPYTHON_AVAILABLE,
     _find_dangling_records,
     _parse_providers,
     _is_internal_record,
     _classify_target,
+    _resolve_hostname_status,
+    _verify_dns_targets,
 )
+
+if _DNSPYTHON_AVAILABLE:
+    import dns.exception
+    import dns.resolver
+
+
+class _StubResolver:
+    """Fake dnspython resolver for tests -- no real DNS queries are made.
+
+    `plan` maps a hostname to one of "ok" / "nxdomain" / "noanswer" / "timeout".
+    """
+
+    def __init__(self, plan):
+        self.plan = plan
+
+    def resolve(self, name, rdtype):
+        outcome = self.plan[name]
+        if outcome == "nxdomain":
+            raise dns.resolver.NXDOMAIN()
+        if outcome == "noanswer":
+            raise dns.resolver.NoAnswer()
+        if outcome == "timeout":
+            raise dns.exception.Timeout()
+        return ["203.0.113.10"]
 
 RECORD_COLS = ["csp", "account", "dnskey", "dnsvalue"]
 INFRA_COLS = ["csp", "account", "service", "value"]
@@ -38,8 +67,12 @@ def test_helpers():
     assert is_cloud_nameserver("ns-1.awsdns-01.org")
     assert is_cloud_nameserver("ns1-01.AZURE-DNS.com")
     assert is_cloud_nameserver("ns-cloud-a1.googledomains.com")
-    assert not is_cloud_nameserver("dana.ns.cloudflare.com")
+    # Cloudflare and OCI run inventoried managed-DNS pools too, so a delegation
+    # into either is judgeable — and takeover-prone once the zone is deleted.
+    assert is_cloud_nameserver("dana.ns.cloudflare.com")
+    assert is_cloud_nameserver("ns1.p68.dns.oraclecloud.net")
     assert not is_cloud_nameserver("ns1.registrar.example")
+    assert not is_cloud_nameserver("ns1.digitalocean.com")
     assert zone_key("Sub.Example.COM.") == "sub.example.com"
 
 
@@ -91,6 +124,83 @@ def test_classify_target():
     assert _classify_target("198.202.211.1") == "External"
 
 
+def test_identify_service():
+    # Known SaaS takeover fingerprints.
+    assert identify_service("foo.github.io.") == "GitHub Pages"
+    assert identify_service("APP.HEROKUAPP.COM") == "Heroku"
+    assert identify_service("shop.myshopify.com") == "Shopify"
+    assert identify_service("site.netlify.app") == "Netlify"
+    assert identify_service("cdn.fastly.net") == "Fastly"
+    assert identify_service("help.zendesk.com") == "Zendesk"
+    assert identify_service("docs.readme.io") == "Readme"
+    assert identify_service("status.statuspage.io") == "Statuspage"
+    assert identify_service("repo.bitbucket.io") == "Bitbucket"
+    # Bare hostname equal to the fingerprinted suffix also matches.
+    assert identify_service("herokudns.com") == "Heroku"
+    # Not a SaaS fingerprint: unknown third party, and first-party cloud
+    # targets (already classified elsewhere, not fingerprinted here).
+    assert identify_service("random.example.com") is None
+    assert identify_service("d1odiojnqoo3w8.cloudfront.net.") is None
+    # Suffix must be a real hostname boundary, not just a substring.
+    assert identify_service("evil-github.io.attacker.example") is None
+
+
+def test_resolve_hostname_status_classification():
+    if not _DNSPYTHON_AVAILABLE:
+        print("dnspython not installed -- skipping DNS classification test")
+        return
+
+    resolver = _StubResolver({
+        "gone.github.io": "nxdomain",
+        "live.herokuapp.com": "ok",
+        "flaky.netlify.app": "timeout",
+        "noanswer.myshopify.com": "noanswer",
+    })
+    # NXDOMAIN -> high-confidence dangling.
+    assert _resolve_hostname_status(resolver, "gone.github.io") == "nxdomain"
+    # NOERROR (with or without an A record) -> still occupied.
+    assert _resolve_hostname_status(resolver, "live.herokuapp.com") == "resolves"
+    assert _resolve_hostname_status(resolver, "noanswer.myshopify.com") == "resolves"
+    # Timeout/resolver error -> inconclusive, never a finding.
+    assert _resolve_hostname_status(resolver, "flaky.netlify.app") == "unknown"
+
+
+def test_verify_dns_targets_dedupes_and_classifies():
+    if not _DNSPYTHON_AVAILABLE:
+        print("dnspython not installed -- skipping DNS verify test")
+        return
+
+    calls = []
+    stub = _StubResolver({
+        "gone.github.io": "nxdomain",
+        "live.herokuapp.com": "ok",
+    })
+    real_resolve = stub.resolve
+
+    def counting_resolve(name, rdtype):
+        calls.append(name)
+        return real_resolve(name, rdtype)
+
+    stub.resolve = counting_resolve
+
+    original_make_resolver = findmytakeover._make_resolver
+    findmytakeover._make_resolver = lambda: stub
+    try:
+        statuses = _verify_dns_targets(
+            ["gone.github.io", "gone.github.io.", "GONE.GITHUB.IO", "live.herokuapp.com"]
+        )
+    finally:
+        findmytakeover._make_resolver = original_make_resolver
+
+    assert statuses == {"gone.github.io": "nxdomain", "live.herokuapp.com": "resolves"}
+    # Each unique (normalized) hostname is resolved exactly once, even though
+    # it was passed in three different casings/forms above.
+    assert sorted(calls) == ["gone.github.io", "live.herokuapp.com"]
+
+    # No hostnames / dnspython unavailable -> no-op, never raises.
+    assert _verify_dns_targets([]) == {}
+
+
 if __name__ == "__main__":
     test_helpers()
     test_dangling_ns_delegation()
@@ -98,4 +208,61 @@ if __name__ == "__main__":
     test_empty_provider_block()
     test_internal_record_filter()
     test_classify_target()
+    test_identify_service()
+    test_resolve_hostname_status_classification()
+    test_verify_dns_targets_dedupes_and_classifies()
     print("ok")
+
+
+def test_exclusions_ipv4_ipv6_and_domains():
+    ex = findmytakeover._parse_exclusions(
+        {"exclude": {"ipaddress": ["100.1.0.0/16", "2001:db8::/32"], "domains": ["example.com"]}}
+    )
+    # Networks are kept as networks, not expanded to 65k individual addresses.
+    assert len(ex.networks) == 2
+    assert ex.matches("100.1.2.3")
+    assert ex.matches("2001:db8::5")          # IPv6 used to raise AddressValueError
+    assert ex.matches("a.example.com")
+    assert not ex.matches("9.9.9.9")
+    assert not ex.matches("a.other.net")
+    # Absent / empty config is not an error.
+    assert not findmytakeover._parse_exclusions({})
+    assert not findmytakeover._parse_exclusions({"exclude": None})
+
+
+def test_find_dangling_accepts_legacy_exclusion_iterable():
+    records = [["aws", "1", "a.example.com", "8.8.8.8"], ["aws", "1", "b.example.com", "1.1.1.1"]]
+    infra = []
+    # A plain set of substrings (the pre-_Exclusions calling convention) still works.
+    assert _dangling_values(records, infra) == {"8.8.8.8", "1.1.1.1"}
+    result = _find_dangling_records(
+        pd.DataFrame(records, columns=RECORD_COLS),
+        pd.DataFrame(infra, columns=INFRA_COLS),
+        exclusions={"8.8.8.8"},
+    )
+    assert set(result["dnsvalue"]) == {"1.1.1.1"}
+
+
+def test_json_report_shape():
+    import json as _json
+    import tempfile
+
+    findings = [
+        {"record": "a.example.com", "target": "gone.github.io", "dns_provider": "aws",
+         "account": "111", "target_owner": "External", "saas_service": "GitHub Pages",
+         "dns_status": "nxdomain", "confidence": "high"},
+        {"record": "b.example.com", "target": "x.elb.amazonaws.com", "dns_provider": "aws",
+         "account": "111", "target_owner": "Amazon Web Services", "saas_service": None,
+         "dns_status": None, "confidence": "inventory-miss"},
+    ]
+    with tempfile.TemporaryDirectory() as d:
+        path = os.path.join(d, "report.json")
+        findmytakeover._write_json_report(path, findings, hidden_internal=3)
+        with open(path) as fh:
+            report = _json.load(fh)
+    assert report["tool"] == "findmytakeover"
+    assert report["summary"]["total"] == 2
+    assert report["summary"]["high_confidence"] == 1
+    assert report["summary"]["hidden_internal"] == 3
+    assert report["summary"]["by_target_owner"]["External"] == 1
+    assert len(report["findings"]) == 2
