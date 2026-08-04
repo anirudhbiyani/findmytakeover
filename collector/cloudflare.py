@@ -67,27 +67,115 @@ class cloudflare:
 
     @staticmethod
     def infra(accounts, cred):
-        """Collect Cloudflare-hosted endpoints (zone names for NS matching, Pages)."""
+        """Collect Cloudflare-hosted endpoints: zones, Pages, Workers, R2, Custom
+        Hostnames, Load Balancers, Spectrum, and Tunnels."""
         client = _client(cred)
         accounts = _resolve_accounts(accounts, client, _is_default_credentials(cred))
         infradata = []
 
         for account in accounts:
             click.echo(f"Getting Infrastructure details from Cloudflare account - {account}")
-            try:
-                # Zone names — the "live zones" a delegated NS record is matched against.
-                for zone in client.zones.list(account={"id": account}):
-                    infradata.append([account, "hostedzone", zone_key(zone.name)])
 
-                # Cloudflare Pages (*.pages.dev subdomain + custom domains)
+            # Zone names — the "live zones" a delegated NS record is matched against.
+            # Also the basis for the per-zone endpoint types collected below.
+            try:
+                zones = list(client.zones.list(account={"id": account}))
+            except APIError as e:
+                click.echo(f"Skipping Cloudflare account {account} - API error listing zones: {e}")
+                continue
+
+            for zone in zones:
+                infradata.append([account, "hostedzone", zone_key(zone.name)])
+
+            # Cloudflare Pages (*.pages.dev subdomain + custom domains)
+            try:
                 for project in client.pages.projects.list(account_id=account):
                     if project.subdomain:
-                        infradata.append([account, "pages", project.subdomain.rstrip(".")])
+                        infradata.append([account, "pages", zone_key(project.subdomain)])
                     for domain in (project.domains or []):
-                        infradata.append([account, "pages", str(domain).rstrip(".")])
+                        infradata.append([account, "pages", zone_key(str(domain))])
             except APIError as e:
-                click.echo(f"Skipping Cloudflare account {account} - API error: {e}")
+                click.echo(f"Skipping Cloudflare Pages for account {account} - API error: {e}")
 
-        # ponytail: Workers/Spectrum hostnames not collected — add if a CNAME to
-        # *.workers.dev shows up as a false positive.
+            # Workers: workers.dev subdomain (per-script) + custom domains bound to a Worker.
+            try:
+                account_subdomain = None
+                try:
+                    account_subdomain = client.workers.subdomains.get(account_id=account).subdomain
+                except APIError:
+                    pass  # workers.dev subdomain not configured for this account
+
+                if account_subdomain:
+                    for script in client.workers.scripts.list(account_id=account):
+                        if script.id:
+                            hostname = f"{script.id}.{account_subdomain}.workers.dev"
+                            infradata.append([account, "workers", zone_key(hostname)])
+
+                for domain in client.workers.domains.list(account_id=account):
+                    if domain.hostname:
+                        infradata.append([account, "workers", zone_key(domain.hostname)])
+            except APIError as e:
+                click.echo(f"Skipping Cloudflare Workers for account {account} - API error: {e}")
+
+            # R2 buckets: public r2.dev domain + any custom domains attached to the bucket.
+            try:
+                buckets = client.r2.buckets.list(account_id=account).buckets or []
+                for bucket in buckets:
+                    if not bucket.name:
+                        continue
+                    try:
+                        managed = client.r2.buckets.domains.managed.list(
+                            bucket_name=bucket.name, account_id=account
+                        )
+                        if managed.domain:
+                            infradata.append([account, "r2", zone_key(managed.domain)])
+                    except APIError:
+                        pass  # r2.dev public access not enabled/permitted for this bucket
+
+                    try:
+                        custom = client.r2.buckets.domains.custom.list(
+                            bucket_name=bucket.name, account_id=account
+                        )
+                        for custom_domain in (custom.domains or []):
+                            if custom_domain.domain:
+                                infradata.append([account, "r2", zone_key(custom_domain.domain)])
+                    except APIError:
+                        pass  # no custom domains configured/permitted for this bucket
+            except APIError as e:
+                click.echo(f"Skipping Cloudflare R2 for account {account} - API error: {e}")
+
+            # Tunnels: CNAME/target hostname is <tunnel-uuid>.cfargotunnel.com
+            try:
+                for tunnel in client.zero_trust.tunnels.cloudflared.list(account_id=account):
+                    if tunnel.id:
+                        hostname = f"{tunnel.id}.cfargotunnel.com"
+                        infradata.append([account, "tunnel", zone_key(hostname)])
+            except APIError as e:
+                click.echo(f"Skipping Cloudflare Tunnels for account {account} - API error: {e}")
+
+            # Per-zone endpoint types: Custom Hostnames (Cloudflare for SaaS),
+            # Load Balancers, and Spectrum applications.
+            for zone in zones:
+                try:
+                    for hostname in client.custom_hostnames.list(zone_id=zone.id):
+                        if hostname.hostname:
+                            infradata.append([account, "customhostname", zone_key(hostname.hostname)])
+                except APIError as e:
+                    click.echo(f"Skipping Custom Hostnames for zone {zone.name} - API error: {e}")
+
+                try:
+                    for lb in client.load_balancers.list(zone_id=zone.id):
+                        if lb.name:
+                            infradata.append([account, "loadbalancer", zone_key(lb.name)])
+                except APIError as e:
+                    click.echo(f"Skipping Load Balancers for zone {zone.name} - API error: {e}")
+
+                try:
+                    for app in client.spectrum.apps.list(zone_id=zone.id):
+                        dns = getattr(app, "dns", None)
+                        if dns is not None and dns.name:
+                            infradata.append([account, "spectrum", zone_key(dns.name)])
+                except APIError as e:
+                    click.echo(f"Skipping Spectrum apps for zone {zone.name} - API error: {e}")
+
         return infradata

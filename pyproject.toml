@@ -1,6 +1,6 @@
 [project]
 name = "findmytakeover"
-version = "1.0.0"
+version = "2.0.0"
 description = "Detect dangling DNS records vulnerable to subdomain takeover across AWS, GCP, Azure, Cloudflare, and Oracle Cloud."
 readme = "README.md"
 license = { file = "LICENSE" }
@@ -11,7 +11,7 @@ dependencies = [
     "click==8.4.1",
     "PyYAML==6.0.3",
     "pandas==3.0.3",
-    "boto3==1.43.14",
+    "boto3==1.43.61",
     "google-cloud-dns==0.37.0",
     "google-auth==2.53.0",
     "google-cloud-resource-manager==1.18.0",
@@ -35,6 +35,16 @@ dependencies = [
     "azure-mgmt-sql==4.0.0",
     "cloudflare==5.5.0",
     "oci==2.182.0",
+    "azure-mgmt-compute==38.2.0",
+    "azure-mgmt-containerservice==41.5.0",
+    "azure-mgmt-appcontainers==5.0.0",
+    "azure-mgmt-cosmosdb==10.0.0",
+    "dnspython==2.8.0",
+    "google-cloud-run==0.16.1",
+    "google-cloud-appengine-admin==1.18.0",
+    "google-cloud-container==2.65.0",
+    "google-cloud-artifact-registry==1.22.0",
+    "requests==2.34.2",
 ]
 
 [project.scripts]

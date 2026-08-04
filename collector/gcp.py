@@ -2,14 +2,20 @@
 
 from concurrent.futures import ThreadPoolExecutor
 
+import requests
 import google.auth
-from google.api_core.exceptions import Forbidden
+from google.api_core.exceptions import Forbidden, GoogleAPICallError, NotFound
+from google.auth.transport.requests import AuthorizedSession
 from google.cloud import dns
 from google.cloud import resourcemanager_v3
 from google.oauth2 import service_account
 from google.cloud import storage
 from google.cloud import compute_v1
 from google.cloud import functions_v2
+from google.cloud import run_v2
+from google.cloud import appengine_admin_v1
+from google.cloud import container_v1
+from google.cloud import artifactregistry_v1
 import click
 
 from collector import is_cloud_nameserver, zone_key, MAX_WORKERS
@@ -19,6 +25,31 @@ _A_AAAA_TYPES = frozenset(("A", "AAAA"))
 _CNAME_TYPE = "CNAME"
 
 _USE_CLI_CREDS = "default"
+
+# Cloud Run's Admin API v2 requires a concrete region per ListServicesRequest —
+# it has no location wildcard ("-") and no list_locations() method (unlike
+# Cloud Functions / GKE / Artifact Registry). We fan out over the known set of
+# regions Cloud Run is available in; add new regions here as Google ships them.
+_CLOUD_RUN_REGIONS = (
+    "africa-south1",
+    "asia-east1", "asia-east2",
+    "asia-northeast1", "asia-northeast2", "asia-northeast3",
+    "asia-south1", "asia-south2",
+    "asia-southeast1", "asia-southeast2",
+    "australia-southeast1", "australia-southeast2",
+    "europe-central2",
+    "europe-north1", "europe-north2",
+    "europe-southwest1",
+    "europe-west1", "europe-west2", "europe-west3", "europe-west4",
+    "europe-west6", "europe-west8", "europe-west9", "europe-west10", "europe-west12",
+    "me-central1", "me-central2", "me-west1",
+    "northamerica-northeast1", "northamerica-northeast2",
+    "southamerica-east1", "southamerica-west1",
+    "us-central1",
+    "us-east1", "us-east4", "us-east5",
+    "us-south1",
+    "us-west1", "us-west2", "us-west3", "us-west4",
+)
 
 
 def _is_default_credentials(path):
@@ -190,5 +221,90 @@ def _infra_for_project(proj, credentials):
     except Forbidden as e:
         if not _api_disabled(e):
             click.echo(f"Skipping Compute Instances for project {proj} - access denied")
+
+    # Cloud Run services
+    try:
+        run_client = run_v2.ServicesClient(credentials=credentials)
+        for region in _CLOUD_RUN_REGIONS:
+            parent = f"projects/{proj}/locations/{region}"
+            try:
+                for service in run_client.list_services(parent=parent):
+                    uri = service.uri
+                    if uri:
+                        infradata.append([proj, "cloudrun", uri.removeprefix("https://")])
+            except Forbidden:
+                raise
+            except GoogleAPICallError:
+                # Region doesn't support Cloud Run (or has no services) - not an error.
+                continue
+    except Forbidden as e:
+        if not _api_disabled(e):
+            click.echo(f"Skipping Cloud Run for project {proj} - access denied")
+
+    # App Engine default service hostname (one application per project, if any)
+    try:
+        appengine_client = appengine_admin_v1.ApplicationsClient(credentials=credentials)
+        application = appengine_client.get_application(name=f"apps/{proj}")
+        hostname = application.default_hostname
+        if hostname:
+            infradata.append([proj, "appengine", hostname.removeprefix("https://")])
+    except NotFound:
+        pass  # No App Engine application in this project - not an error.
+    except Forbidden as e:
+        if not _api_disabled(e):
+            click.echo(f"Skipping App Engine for project {proj} - access denied")
+
+    # GKE cluster control-plane endpoints
+    try:
+        gke_client = container_v1.ClusterManagerClient(credentials=credentials)
+        response = gke_client.list_clusters(parent=f"projects/{proj}/locations/-")
+        for cluster in response.clusters:
+            if cluster.endpoint:
+                infradata.append([proj, "gke", cluster.endpoint])
+    except Forbidden as e:
+        if not _api_disabled(e):
+            click.echo(f"Skipping GKE for project {proj} - access denied")
+
+    # Artifact Registry repository hostnames (e.g. REGION-docker.pkg.dev)
+    try:
+        ar_client = artifactregistry_v1.ArtifactRegistryClient(credentials=credentials)
+        for location in ar_client.list_locations(name=f"projects/{proj}"):
+            parent = f"projects/{proj}/locations/{location.location_id}"
+            for repository in ar_client.list_repositories(parent=parent):
+                registry_uri = repository.registry_uri
+                if registry_uri:
+                    host = registry_uri.removeprefix("https://").split("/", 1)[0]
+                    infradata.append([proj, "artifactregistry", host])
+    except Forbidden as e:
+        if not _api_disabled(e):
+            click.echo(f"Skipping Artifact Registry for project {proj} - access denied")
+
+    # Cloud SQL public instance IPs. There's no stable google-cloud-* client
+    # for the SQL Admin API, so we call the REST API directly via an
+    # AuthorizedSession bound to the same credentials used everywhere else.
+    try:
+        session = AuthorizedSession(credentials)
+        url = f"https://sqladmin.googleapis.com/sql/v1beta4/projects/{proj}/instances"
+        page_token = None
+        while True:
+            params = {"pageToken": page_token} if page_token else {}
+            resp = session.get(url, params=params)
+            if resp.status_code == 403:
+                body = resp.json() if resp.content else {}
+                message = body.get("error", {}).get("message", "")
+                if not _api_disabled(message):
+                    click.echo(f"Skipping Cloud SQL for project {proj} - access denied")
+                break
+            resp.raise_for_status()
+            body = resp.json()
+            for instance in body.get("items", []):
+                for ip in instance.get("ipAddresses", []):
+                    if ip.get("type") == "PRIMARY" and ip.get("ipAddress"):
+                        infradata.append([proj, "cloudsql", ip["ipAddress"]])
+            page_token = body.get("nextPageToken")
+            if not page_token:
+                break
+    except requests.RequestException as e:
+        click.echo(f"Skipping Cloud SQL for project {proj} - request failed: {e}")
 
     return infradata
