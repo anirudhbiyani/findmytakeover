@@ -4,10 +4,7 @@ findmytakeover detects dangling DNS record in a multi cloud environment. It does
 
 This tool is not tested to run on non commercial Cloud Service Provider regions like AWS GovCloud, Azure Government or Google for Government but should be able to run without any issues. 
 
-![findmytakeover output](docs/demo-output.svg "findmytakeover finding dangling DNS records across five clouds")
-
-*Output from `python3 demo/demo.py`, which runs the real detection pipeline
-against a fixture inventory — regenerate with `python3 demo/render_svg.py`.*
+![findmytakeover](findmytakeover.jpg "findmytakeover")
 
 ## Why?
 They are a threat because they allow attackers to host infrastructure behind your domain which can be used for any sort of puropose and getting the entire traffic to an attacker-controlled domain with complete access to the domain’s content and resources.
