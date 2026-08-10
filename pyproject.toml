@@ -34,7 +34,7 @@ dependencies = [
     "azure-mgmt-redis==14.5.0",
     "azure-mgmt-sql==4.0.0",
     "cloudflare==5.5.0",
-    "oci==2.182.0",
+    "oci==2.184.0",
     "azure-mgmt-compute==38.2.0",
     "azure-mgmt-containerservice==41.5.0",
     "azure-mgmt-appcontainers==5.0.0",
