@@ -129,7 +129,7 @@ def test_dns_records_contract():
     # for every record returned, before branching on `type`; the collector
     # only actually acts on A/AAAA/CNAME (dns()) and NS (child-delegation
     # detection), so those are the members pinned here.
-    for name in ("A", "AAAA", "CNAME", "NS"):
+    for name in ("ARecord", "AAAARecord", "CNAMERecord", "NSRecord"):
         cls = getattr(rr, name)
         _assert_model_field(cls, "name")
         _assert_model_field(cls, "content")
