@@ -22,7 +22,7 @@ dependencies = [
     "azure-identity==1.25.3",
     "azure-mgmt-resource==25.0.0",
     "azure-mgmt-subscription==3.1.1",
-    "azure-mgmt-network==31.0.1",
+    "azure-mgmt-network==32.0.0",
     "azure-mgmt-cdn==14.0.0",
     "azure-mgmt-trafficmanager==1.1.0",
     "azure-mgmt-web==11.0.0",
