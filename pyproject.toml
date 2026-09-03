@@ -13,7 +13,7 @@ dependencies = [
     "pandas==3.0.5",
     "boto3==1.43.66",
     "google-cloud-dns==0.37.1",
-    "google-auth==2.56.3",
+    "google-auth==2.57.0",
     "google-cloud-resource-manager==1.18.0",
     "google-cloud-storage==3.10.1",
     "google-cloud-functions==1.24.0",
