@@ -36,7 +36,7 @@ dependencies = [
     "cloudflare==5.6.0",
     "oci==2.184.0",
     "azure-mgmt-compute==38.2.0",
-    "azure-mgmt-containerservice==41.5.0",
+    "azure-mgmt-containerservice==41.6.0",
     "azure-mgmt-appcontainers==5.0.0",
     "azure-mgmt-cosmosdb==10.0.0",
     "dnspython==2.8.0",
