@@ -37,8 +37,8 @@ jobs:
       - name: Smoke test — entrypoint runs
         run: docker run --rm "findmytakeover:${{ steps.ver.outputs.version }}" --help
 
-      - name: Smoke test — every cloud collector imports inside distroless
+      - name: Smoke test — every cloud collector imports inside the image
         run: >-
-          docker run --rm --entrypoint /usr/bin/python3
+          docker run --rm --entrypoint python
           "findmytakeover:${{ steps.ver.outputs.version }}"
           -c "import findmytakeover, collector.aws, collector.gcp, collector.msazure, collector.cloudflare, collector.oracle; print('imports ok')"

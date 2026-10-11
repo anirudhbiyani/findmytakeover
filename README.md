@@ -20,7 +20,7 @@ findmytakeover --help
 ```
 
 ### With Docker
-The image is distroless, so config and cloud credentials are supplied at run
+The image (Python 3.14 on Alpine) runs as a non-root user; config and cloud credentials are supplied at run
 time via volume mounts:
 ```
 docker build -t findmytakeover .
