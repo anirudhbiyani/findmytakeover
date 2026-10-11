@@ -1,7 +1,6 @@
 # ---- build stage --------------------------------------------------------
-# Must match the distroless runtime's interpreter: distroless python3-debian13
-# ships Python 3.13, so build the wheels against 3.13 on the same (trixie) libc.
-FROM python:3.13-slim-trixie AS builder
+# Same base as the runtime so wheels built here match its interpreter and musl.
+FROM python:3.14-alpine AS builder
 
 ENV PIP_NO_CACHE_DIR=1 \
     PIP_DISABLE_PIP_VERSION_CHECK=1 \
@@ -19,17 +18,21 @@ COPY collector ./collector
 RUN pip install --no-cache-dir --target=/packages .
 
 # ---- runtime stage ------------------------------------------------------
-# Distroless: no shell, no package manager, no root — just the interpreter and
-# our code. The :nonroot tag runs as uid 65532 with HOME=/home/nonroot.
-FROM gcr.io/distroless/python3-debian13:nonroot
+# Alpine keeps the image small; build tooling stays behind in the builder.
+# Runs as an unprivileged uid 65532 with HOME=/home/nonroot (same as the old
+# distroless image, so existing credential mount paths keep working).
+FROM python:3.14-alpine
 
 ENV PYTHONPATH=/packages \
     PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1
 
+RUN adduser -D -u 65532 -h /home/nonroot nonroot
+
 COPY --from=builder /packages /packages
 
 WORKDIR /app
+USER nonroot
 
 # Config and read-only cloud credentials are supplied at runtime via mounts, e.g.:
 #   docker run --rm \
@@ -38,7 +41,5 @@ WORKDIR /app
 #     -v "$HOME/.config/gcloud:/home/nonroot/.config/gcloud:ro" \
 #     -v "$HOME/.azure:/home/nonroot/.azure:ro" \
 #     findmytakeover
-#
-# No shell in the image — run the module with the image's own interpreter.
-ENTRYPOINT ["/usr/bin/python3", "-m", "findmytakeover"]
+ENTRYPOINT ["python", "-m", "findmytakeover"]
 CMD ["--config-file", "/app/findmytakeover.config"]

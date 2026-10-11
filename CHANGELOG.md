@@ -8,6 +8,14 @@ the project aims to follow [Semantic Versioning](https://semver.org/spec/v2.0.0.
 Entries for 1.x predate this file and were reconstructed from git history, so
 they summarise the shape of each release rather than listing every commit.
 
+## [Unreleased]
+
+### Changed
+
+- Docker image moved from distroless (Debian 13 / Python 3.13) to
+  `python:3.14-alpine`. Still runs as non-root uid 65532 with
+  `HOME=/home/nonroot`, so existing credential mounts are unchanged.
+
 ## [2.0.0] — 2026-08-04
 
 Everything in this release landed in 2026. It roughly triples the tool's
