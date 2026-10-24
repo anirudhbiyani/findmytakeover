@@ -11,7 +11,7 @@ import click
 import pandas as pd
 import yaml
 
-from collector import MAX_WORKERS
+from collector import MAX_WORKERS, is_aws_nameserver
 from collector.fingerprints import identify_service
 
 # Passive DNS-resolution check (opt-out via --no-verify-dns). Optional
@@ -258,14 +258,15 @@ _TARGET_SIGNATURES = (
         "awsdns", "awsglobalaccelerator.com", "elasticbeanstalk.com",
     )),
     ("Microsoft Azure", (
-        "azure.com", "azure-dns.", "azurewebsites.net", "trafficmanager.net",
-        "azurefd.net", "azureedge.net", "cloudapp.azure.com", "core.windows.net",
-        "azurecr.io", "search.windows.net", "cache.windows.net",
-        "database.windows.net", "azurestaticapps.net", "azurecontainerapps.io",
+        "azure.com", "azure-dns.com", "azure-dns.net", "azure-dns.org", "azure-dns.info",
+        "azurewebsites.net", "trafficmanager.net", "azurefd.net", "azureedge.net",
+        "cloudapp.azure.com", "core.windows.net", "azurecr.io", "search.windows.net",
+        "cache.windows.net", "database.windows.net", "azurestaticapps.net",
+        "azurecontainerapps.io",
     )),
     ("Google Cloud Platform", (
         "googleapis.com", "googledomains.com", "appspot.com", "run.app",
-        "cloudfunctions.net", ".goog", "googleusercontent.com",
+        "cloudfunctions.net", "goog", "googleusercontent.com",
     )),
 )
 
@@ -278,6 +279,11 @@ _TARGET_ORDER = (
 )
 
 
+def _has_dns_suffix(hostname, suffix):
+    """Match a complete DNS suffix label, not an arbitrary substring."""
+    return hostname == suffix or hostname.endswith("." + suffix)
+
+
 def _classify_target(value):
     """Which provider owns the resource a record points at (External = SaaS/third-party or a bare IP)."""
     v = str(value).rstrip(".").lower()
@@ -286,8 +292,11 @@ def _classify_target(value):
     # ALIAS finding is filed under third-party SaaS, which is plainly wrong.
     if v.startswith("/subscriptions/") and "/providers/microsoft." in v:
         return "Microsoft Azure"
-    for label, needles in _TARGET_SIGNATURES:
-        if any(n in v for n in needles):
+    for label, suffixes in _TARGET_SIGNATURES:
+        if any(
+            is_aws_nameserver(v) if suffix == "awsdns" else _has_dns_suffix(v, suffix)
+            for suffix in suffixes
+        ):
             return label
     return "External"
 

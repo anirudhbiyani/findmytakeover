@@ -16,6 +16,12 @@ they summarise the shape of each release rather than listing every commit.
   `python:3.14-alpine`. Still runs as non-root uid 65532 with
   `HOME=/home/nonroot`, so existing credential mounts are unchanged.
 
+### Fixed
+
+- Match cloud targets and nameservers by DNS suffix boundaries, preventing
+  provider-looking substrings in unrelated hostnames from being classified as
+  cloud infrastructure.
+
 ## [2.0.0] — 2026-08-04
 
 Everything in this release landed in 2026. It roughly triples the tool's
