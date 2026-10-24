@@ -73,6 +73,11 @@ def test_helpers():
     assert is_cloud_nameserver("ns1.p68.dns.oraclecloud.net")
     assert not is_cloud_nameserver("ns1.registrar.example")
     assert not is_cloud_nameserver("ns1.digitalocean.com")
+    # Provider tokens inside unrelated hostnames are not provider DNS suffixes.
+    assert not is_cloud_nameserver("ns-1.awsdns-01.org.attacker.example")
+    assert not is_cloud_nameserver("notawsdns.example.com")
+    assert not is_cloud_nameserver("fake.azure-dns.attacker.example")
+    assert not is_cloud_nameserver("cloud.goog.attacker.example")
     assert zone_key("Sub.Example.COM.") == "sub.example.com"
 
 
@@ -127,6 +132,12 @@ def test_classify_target():
     arm = "/subscriptions/1111/resourcegroups/rg/providers/microsoft.network/publicipaddresses/pip"
     assert _classify_target(arm) == "Microsoft Azure"
     assert _classify_target(arm.upper()) == "Microsoft Azure"
+    assert _classify_target("ns-1.awsdns-01.org") == "Amazon Web Services"
+    # Provider-looking substrings outside a DNS label suffix stay External.
+    assert _classify_target("evilcloudfront.net.attacker.example") == "External"
+    assert _classify_target("fake.azure-dns.attacker.example") == "External"
+    assert _classify_target("cloud.goog.attacker.example") == "External"
+    assert _classify_target("notawsdns.example.com") == "External"
     # A path-looking value that isn't an ARM id stays External.
     assert _classify_target("/subscriptions/1111/something/else") == "External"
 
