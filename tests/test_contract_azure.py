@@ -196,6 +196,9 @@ def test_dns_management_client_contract():
         AaaaRecord,
         CnameRecord,
         NsRecord,
+        MxRecord,
+        SrvRecord,
+        TxtRecord,
         SubResource,
     )
 
@@ -213,11 +216,17 @@ def test_dns_management_client_contract():
         "cname_record",
         "target_resource",
         "ns_records",
+        "mx_records",
+        "srv_records",
+        "txt_records",
     )
     _assert_fields(ARecord(), "ipv4_address")
     _assert_fields(AaaaRecord(), "ipv6_address")
     _assert_fields(CnameRecord(), "cname")
     _assert_fields(NsRecord(), "nsdname")
+    _assert_fields(MxRecord(), "preference", "exchange")
+    _assert_fields(SrvRecord(), "priority", "weight", "port", "target")
+    _assert_fields(TxtRecord(), "value")
     _assert_fields(SubResource(), "id")  # record.target_resource.id
 
 
@@ -470,7 +479,7 @@ def test_cognitivesearch_client_contract():
     _assert_operation(
         SearchManagementClient, "services", ServicesOperations, "list_by_resource_group"
     )
-    _assert_fields(SearchService(location="eastus"), "name")
+    _assert_fields(SearchService(location="eastus"), "name", "endpoint")
 
 
 # --------------------------------------------------------------------------
@@ -602,3 +611,51 @@ def test_cosmosdb_client_contract():
 
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, "-v"]))
+
+
+# --------------------------------------------------------------------------
+# Sovereign clouds - every client must honour the cloud's ARM endpoint
+# --------------------------------------------------------------------------
+
+
+def test_clients_target_the_configured_cloud():
+    """Azure Government only works if every management client sends requests
+    (and asks for tokens) to management.usgovcloudapi.net. A client that
+    ignored base_url would silently query the public cloud instead."""
+    from collector import msazure
+
+    class _Credential:
+        def get_token(self, *scopes, **kwargs):
+            raise AssertionError("no token should be requested at construction")
+
+    authority, endpoint = msazure._cloud("AzureUSGovernment")
+    assert authority == "login.microsoftonline.us"
+    assert msazure._cloud(None)[1] == "https://management.azure.com"
+    with pytest.raises(ValueError):
+        msazure._cloud("AzureChinaCloud")
+
+    clients = msazure._create_azure_clients(_Credential(), "sub", endpoint)
+    assert set(clients) == set(msazure._CLIENT_CLASSES)
+    for name, client in clients.items():
+        # Older generated clients bake the URL into the pipeline client; newer
+        # ones keep a "{endpoint}" template there and the URL in their config.
+        base_url = getattr(client._config, "base_url", None) or client._client._base_url
+        assert base_url == endpoint, name
+        assert client._config.credential_scopes == [f"{endpoint}/.default"], name
+
+
+def test_secondary_rdata_from_record_sets():
+    from azure.mgmt.dns.models import MxRecord, RecordSet, SrvRecord, TxtRecord
+
+    from collector import msazure
+
+    record = RecordSet(
+        mx_records=[MxRecord(preference=10, exchange="mx.example.com")],
+        srv_records=[SrvRecord(priority=1, weight=5, port=443, target="sip.example.com")],
+        txt_records=[TxtRecord(value=["v=spf1 incl", "ude:a.example.com -all"])],
+    )
+    assert list(msazure._secondary_rdata(record)) == [
+        ("MX", "10 mx.example.com"),
+        ("SRV", "1 5 443 sip.example.com"),
+        ("TXT", "v=spf1 include:a.example.com -all"),
+    ]

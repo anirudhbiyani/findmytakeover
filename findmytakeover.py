@@ -4,6 +4,7 @@ import argparse
 import ipaddress
 import json
 import os
+import re
 import sys
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
@@ -11,8 +12,15 @@ import click
 import pandas as pd
 import yaml
 
-from collector import MAX_WORKERS, is_aws_nameserver
-from collector.fingerprints import identify_service
+from collector import (
+    COLLECTION_ERRORS,
+    MAX_WORKERS,
+    SECONDARY_RECORD_TYPES,
+    has_dns_suffix,
+    is_aws_nameserver,
+    note_error,
+)
+from collector.fingerprints import http_fingerprint, identify_service
 
 # Passive DNS-resolution check (opt-out via --no-verify-dns). Optional
 # dependency: degrade gracefully if dnspython isn't installed.
@@ -63,6 +71,11 @@ def read_config(config_path):
         click.echo("Invalid YAML file!")
         sys.exit(1)
 
+    # An empty file parses as None, a bare scalar as a string.
+    if not isinstance(config, dict):
+        click.echo(f"Invalid Configuration! {config_path} must contain 'dns' and 'infra' sections.")
+        sys.exit(1)
+
     # Parse exclusions
     exclude = _parse_exclusions(config)
 
@@ -81,7 +94,8 @@ def read_config(config_path):
 
 class _Exclusions:
     """Exclusion rules from config: IP networks matched by containment, domains
-    matched as substrings.
+    matched as DNS suffixes (example.com excludes a.example.com, not
+    notexample.com).
 
     Networks are kept as networks rather than expanded to individual addresses —
     expanding even the README's own 100.1.0.0/16 example produced 65,536 entries,
@@ -105,7 +119,7 @@ class _Exclusions:
                 pass
             else:
                 return any(address in network for network in self.networks)
-        return any(domain in text for domain in self.domains)
+        return any(has_dns_suffix(text, domain) for domain in self.domains)
 
 
 def _parse_exclusions(config):
@@ -155,9 +169,18 @@ def _parse_providers(config, section):
             if not use_default and not accounts:
                 raise KeyError(f"Missing accounts for {provider_name} (required when not using 'default' credentials)")
 
+            # Sovereign-cloud selection. AWS needs no option: the partition
+            # follows the profile's region (us-gov-west-1 → aws-us-gov).
+            options = {}
+            if provider_config.get("cloud"):
+                if provider_name != "azure":
+                    raise KeyError(f"'cloud' is only supported for azure, not {provider_name}")
+                options["cloud"] = provider_config["cloud"]
+
             providers[provider_name] = {
                 "credentials": credentials,
                 "accounts": accounts,
+                "options": options,
             }
 
     except KeyError as e:
@@ -179,11 +202,17 @@ def _collect_dns_records(dns_config):
             continue
 
         provider_name = _PROVIDER_NAMES[provider]
-        collector = _get_collector(provider)
-
-        data = collector.dns(config["accounts"], config["credentials"])
+        try:
+            collector = _get_collector(provider)
+            data = collector.dns(config["accounts"], config["credentials"], **config.get("options", {}))
+        except Exception as e:
+            # One broken provider shouldn't cost the others' results.
+            note_error(provider_name, "(all accounts)", "DNS records", e)
+            continue
+        # Rows are [account, name, value] or, for MX/SRV/TXT, [account, name, value, type].
         provider_records = [
-            [provider_name, item[0], item[1], item[2]] for item in data
+            [provider_name, item[0], item[1], item[2], item[3] if len(item) > 3 else ""]
+            for item in data
         ]
         click.echo(f"Collected {len(provider_records)} DNS record(s) from {provider_name}")
         records.extend(provider_records)
@@ -204,9 +233,12 @@ def _collect_infrastructure(infra_config):
             continue
 
         provider_name = _PROVIDER_NAMES[provider]
-        collector = _get_collector(provider)
-
-        data = collector.infra(config["accounts"], config["credentials"])
+        try:
+            collector = _get_collector(provider)
+            data = collector.infra(config["accounts"], config["credentials"], **config.get("options", {}))
+        except Exception as e:
+            note_error(provider_name, "(all accounts)", "infrastructure", e)
+            continue
         provider_infra = [
             [provider_name, item[0], item[1], item[2]] for item in data
         ]
@@ -256,13 +288,15 @@ _TARGET_SIGNATURES = (
     ("Amazon Web Services", (
         "amazonaws.com", "cloudfront.net", "acm-validations.aws",
         "awsdns", "awsglobalaccelerator.com", "elasticbeanstalk.com",
+        "amazoncognito.com",
     )),
     ("Microsoft Azure", (
         "azure.com", "azure-dns.com", "azure-dns.net", "azure-dns.org", "azure-dns.info",
         "azurewebsites.net", "trafficmanager.net", "azurefd.net", "azureedge.net",
-        "cloudapp.azure.com", "core.windows.net", "azurecr.io", "search.windows.net",
-        "cache.windows.net", "database.windows.net", "azurestaticapps.net",
-        "azurecontainerapps.io",
+        "windows.net", "azurecr.io", "azurestaticapps.net", "azurecontainerapps.io",
+        # Azure Government
+        "azure.us", "azuregov-dns.us", "usgovcloudapi.net", "azurewebsites.us",
+        "usgovtrafficmanager.net", "azurecr.us", "azurefd.us",
     )),
     ("Google Cloud Platform", (
         "googleapis.com", "googledomains.com", "appspot.com", "run.app",
@@ -279,11 +313,6 @@ _TARGET_ORDER = (
 )
 
 
-def _has_dns_suffix(hostname, suffix):
-    """Match a complete DNS suffix label, not an arbitrary substring."""
-    return hostname == suffix or hostname.endswith("." + suffix)
-
-
 def _classify_target(value):
     """Which provider owns the resource a record points at (External = SaaS/third-party or a bare IP)."""
     v = str(value).rstrip(".").lower()
@@ -294,7 +323,7 @@ def _classify_target(value):
         return "Microsoft Azure"
     for label, suffixes in _TARGET_SIGNATURES:
         if any(
-            is_aws_nameserver(v) if suffix == "awsdns" else _has_dns_suffix(v, suffix)
+            is_aws_nameserver(v) if suffix == "awsdns" else has_dns_suffix(v, suffix)
             for suffix in suffixes
         ):
             return label
@@ -359,15 +388,95 @@ def _verify_dns_targets(hostnames):
     return results
 
 
+# Any S3 endpoint hostname: bucket.s3.amazonaws.com, bucket.s3.us-east-1.amazonaws.com,
+# bucket.s3-website-us-east-1.amazonaws.com, bucket.s3.dualstack.us-gov-west-1.amazonaws.com.
+# Bucket names may contain dots (website buckets are named after the site), so
+# the bucket is everything before the last ".s3" label.
+# The endpoint labels are matched as [a-z0-9]+ runs split by "." or "-" so the
+# two can't both claim a "-": overlapping them backtracks exponentially.
+_S3_HOSTNAME = re.compile(r"^(?P<bucket>.+)\.s3(?:[.-][a-z0-9]+)*\.amazonaws\.com$")
+
+
+def _match_key(value):
+    """Canonical form a DNS value and an inventory value are compared in.
+
+    Route 53 alias targets come back as "dualstack.my-lb.us-east-1.elb.amazonaws.com."
+    while the ELB API says "my-lb.us-east-1.elb.amazonaws.com"; DNS is
+    case-insensitive; an IPv6 address has many spellings; and S3 inventory
+    holds bucket names, not the endpoint hostnames records point at.
+    """
+    key = str(value).strip().rstrip(".").lower().removeprefix("dualstack.")
+    try:
+        return ipaddress.ip_address(key).compressed
+    except ValueError:
+        pass
+    s3 = _S3_HOSTNAME.match(key)
+    return s3.group("bucket") if s3 else key
+
+
+_HTTP_TIMEOUT = 5.0
+_HTTP_MAX_BYTES = 256 * 1024
+
+
+def _http_fingerprint_status(session, hostname, pattern):
+    """Fetch a subdomain and classify it as "matched" (the provider's unclaimed
+    page), "no-match" (something else is served) or "unknown" (no response).
+
+    TLS isn't verified: an unclaimed hostname usually serves the provider's
+    certificate, and only the response body is read — nothing is sent.
+    """
+    for scheme in ("https", "http"):
+        try:
+            with session.get(
+                f"{scheme}://{hostname}",
+                timeout=_HTTP_TIMEOUT,
+                verify=False,
+                allow_redirects=True,
+                stream=True,
+            ) as response:
+                body = response.raw.read(_HTTP_MAX_BYTES, decode_content=True)
+        except Exception:
+            continue
+        text = body.decode(response.encoding or "utf-8", errors="replace")
+        return "matched" if re.search(pattern, text) else "no-match"
+    return "unknown"
+
+
+def _verify_http_targets(patterns):
+    """Fetch each {hostname: fingerprint regex} in parallel. Never raises."""
+    import requests
+    import urllib3
+
+    urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+    session = requests.Session()
+    session.headers["User-Agent"] = f"findmytakeover/{_version()}"
+    results = {}
+    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as pool:
+        futures = {
+            pool.submit(_http_fingerprint_status, session, host, pattern): host
+            for host, pattern in patterns.items()
+        }
+        for future in as_completed(futures):
+            try:
+                results[futures[future]] = future.result()
+            except Exception:
+                results[futures[future]] = "unknown"
+    return results
+
+
 def _find_dangling_records(records_df, infrastructure_df, exclusions):
     """Find DNS records that don't have matching infrastructure."""
+    if "rtype" not in records_df:
+        records_df = records_df.assign(rtype="")
+    infrastructure_df = infrastructure_df.assign(
+        _key=infrastructure_df["value"].map(_match_key)
+    ).drop_duplicates("_key")
     result = pd.merge(
-        records_df,
+        records_df.assign(_key=records_df["dnsvalue"].map(_match_key)),
         infrastructure_df,
-        left_on="dnsvalue",
-        right_on="value",
+        on="_key",
         how="left",
-    ).fillna(value="")
+    ).drop(columns="_key").fillna(value="")
 
     # Apply exclusions in a single vectorized pass. Accepts a plain iterable of
     # substring patterns too, so callers (and tests) predating _Exclusions work.
@@ -423,9 +532,9 @@ def main():
         default=True,
         help=(
             "Resolve third-party SaaS targets that match a known takeover "
-            "fingerprint to confirm NXDOMAIN dangling records (requires the "
-            "dnspython package). Use --no-verify-dns to disable network "
-            "lookups entirely."
+            "fingerprint, and third-party MX/SRV/SPF targets, to confirm "
+            "NXDOMAIN dangling records (requires the dnspython package). Use "
+            "--no-verify-dns to disable network lookups entirely."
         ),
     )
     parser.add_argument(
@@ -446,6 +555,16 @@ def main():
             "existing scripts keep their exit codes."
         ),
     )
+    parser.add_argument(
+        "--verify-http",
+        action="store_true",
+        help=(
+            "Fetch fingerprinted SaaS subdomains over HTTP(S) and match the "
+            "provider's 'no such site' page, confirming takeovers that DNS can't "
+            "(most SaaS providers wildcard their DNS). Off by default: it sends "
+            "requests to your subdomains."
+        ),
+    )
     parser.add_argument("--version", action="version", version=f"findmytakeover {_version()}")
 
     args = parser.parse_args()
@@ -459,7 +578,7 @@ def main():
 
     # Create DataFrames
     records_df = pd.DataFrame(
-        record_list, columns=["csp", "account", "dnskey", "dnsvalue"]
+        record_list, columns=["csp", "account", "dnskey", "dnsvalue", "rtype"]
     )
     infrastructure_df = pd.DataFrame(
         infrastructure_list, columns=["csp", "account", "service", "value"]
@@ -468,7 +587,8 @@ def main():
     # Dump data if requested
     if args.dump_file:
         click.echo(f"Dumping data to file - {args.dump_file}")
-        infrastructure_df.to_csv(args.dump_file, mode="a", index=False)
+        # Overwrite: appending mixed every earlier run's inventory into this one.
+        infrastructure_df.to_csv(args.dump_file, mode="w", index=False)
         with open(args.dump_file, "a") as f:
             f.write("-" * 100 + "\n")
         records_df.to_csv(args.dump_file, mode="a", index=False)
@@ -489,6 +609,7 @@ def main():
     # targets are set aside for SaaS fingerprinting below.
     grouped = {label: [] for label in _TARGET_ORDER if label != "External"}
     external_entries = []
+    secondary_entries = []  # third-party MX/SRV/SPF targets, reported only if NXDOMAIN
     findings = []
     hidden_internal = 0
     for idx in result.index:
@@ -497,12 +618,14 @@ def main():
 
         name = result.loc[idx, "dnskey"]
         value = result.loc[idx, "dnsvalue"]
+        rtype = result.loc[idx, "rtype"]
         if _is_internal_record(name, value):
             hidden_internal += 1
             continue
 
+        type_tag = f"{'SPF include' if rtype == 'TXT' else rtype} " if rtype else ""
         line = (
-            f"  {name} -> {value} "
+            f"  {name} -> {type_tag}{value} "
             f"[{result.loc[idx, 'csp_x']} zone, account/subscription/project: {result.loc[idx, 'account_x']}]"
         )
         label = _classify_target(value)
@@ -512,14 +635,25 @@ def main():
         # can never disagree.
         finding = {
             "record": str(name).rstrip("."),
+            "record_type": rtype or None,
             "target": str(value).rstrip("."),
             "dns_provider": str(result.loc[idx, "csp_x"]),
             "account": str(result.loc[idx, "account_x"]),
             "target_owner": label,
             "saas_service": None,
             "dns_status": None,
+            "http_status": None,
             "confidence": "inventory-miss",
         }
+
+        # Almost every zone has an MX at a mail provider and an SPF include of
+        # one; those are never in inventory. Only a target that no longer exists
+        # is a finding, so hold them back until DNS has been checked.
+        if rtype in SECONDARY_RECORD_TYPES and label == "External":
+            finding["saas_service"] = identify_service(value)
+            secondary_entries.append({"value": value, "line": line, "finding": finding})
+            continue
+
         findings.append(finding)
 
         if label == "External":
@@ -529,21 +663,52 @@ def main():
             grouped[label].append(line)
 
     # SaaS takeover fingerprinting + passive DNS confirmation, scoped to the
-    # External bucket. Only fingerprinted hostnames are resolved -- this is
-    # DNS-only (no HTTP) and NXDOMAIN is the only signal treated as a finding.
+    # External bucket. Only fingerprinted hostnames (and third-party MX/SRV/SPF
+    # targets) are resolved, and NXDOMAIN is the only DNS signal treated as a
+    # finding.
     dns_status = {}
-    fingerprinted_hostnames = {e["value"] for e in external_entries if e["finding"]["saas_service"]}
-    if fingerprinted_hostnames:
+    hostnames_to_check = {e["value"] for e in external_entries if e["finding"]["saas_service"]}
+    hostnames_to_check |= {e["value"] for e in secondary_entries}
+    if hostnames_to_check:
         if not args.verify_dns:
-            click.echo("\nDNS verification disabled (--no-verify-dns); skipping NXDOMAIN checks on fingerprinted SaaS targets.")
+            click.echo("\nDNS verification disabled (--no-verify-dns); skipping NXDOMAIN checks on SaaS, mail and SPF targets.")
         elif not _DNSPYTHON_AVAILABLE:
             click.echo(
                 "\nDNS verification requested but the 'dnspython' package isn't installed "
-                "(pip install dnspython); skipping NXDOMAIN checks on fingerprinted SaaS targets."
+                "(pip install dnspython); skipping NXDOMAIN checks on SaaS, mail and SPF targets."
             )
         else:
-            click.echo(f"\nResolving {len(fingerprinted_hostnames)} fingerprinted SaaS hostname(s) to check for NXDOMAIN...")
-            dns_status = _verify_dns_targets(fingerprinted_hostnames)
+            click.echo(f"\nResolving {len(hostnames_to_check)} third-party hostname(s) to check for NXDOMAIN...")
+            dns_status = _verify_dns_targets(hostnames_to_check)
+
+    # MX/SRV/SPF targets: a third-party target that doesn't exist means mail
+    # or SPF is pointed at a name someone may be able to register.
+    missing_secondary = []
+    for entry in secondary_entries:
+        finding = entry["finding"]
+        status = dns_status.get(str(entry["value"]).rstrip(".").lower())
+        if status != "nxdomain":
+            continue
+        finding["dns_status"] = status
+        finding["confidence"] = "target-nxdomain"
+        findings.append(finding)
+        missing_secondary.append(f"{entry['line']}  [target does not exist — check whether its domain can be registered]")
+
+    # Opt-in HTTP confirmation for fingerprinted targets DNS couldn't settle:
+    # most SaaS providers wildcard their DNS, but serve a recognisable
+    # "no such site" page for a hostname nobody has claimed.
+    http_status = {}
+    if args.verify_http:
+        to_fetch = {
+            e["finding"]["record"]: http_fingerprint(e["finding"]["saas_service"])
+            for e in external_entries
+            if e["finding"]["saas_service"]
+            and http_fingerprint(e["finding"]["saas_service"])
+            and dns_status.get(str(e["value"]).rstrip(".").lower()) != "nxdomain"
+        }
+        if to_fetch:
+            click.echo(f"Fetching {len(to_fetch)} subdomain(s) over HTTP to match takeover fingerprints...")
+            http_status = _verify_http_targets(to_fetch)
 
     takeover_candidates = []  # (a) fingerprinted + confirmed NXDOMAIN
     fingerprinted_unconfirmed = []  # (b) fingerprinted, still resolving or DNS status unknown
@@ -558,8 +723,12 @@ def main():
 
         status = dns_status.get(str(entry["value"]).rstrip(".").lower())
         finding["dns_status"] = status
+        finding["http_status"] = http_status.get(finding["record"])
         if status == "nxdomain":
             takeover_candidates.append(f"{entry['line']}  [{service} — NXDOMAIN, likely claimable]")
+            finding["confidence"] = "high"
+        elif finding["http_status"] == "matched":
+            takeover_candidates.append(f"{entry['line']}  [{service} — unclaimed-site page served, likely claimable]")
             finding["confidence"] = "high"
         elif status == "resolves":
             fingerprinted_unconfirmed.append(f"{entry['line']}  [{service} — still resolving]")
@@ -576,6 +745,7 @@ def main():
         + len(takeover_candidates)
         + len(fingerprinted_unconfirmed)
         + len(unclassified_external)
+        + len(missing_secondary)
     )
 
     if dangling_count == 0:
@@ -595,7 +765,7 @@ def main():
         if external_total:
             click.echo(f"\n=== Targets on External / third-party (SaaS, bare IPs) ({external_total}) ===")
             if takeover_candidates:
-                click.echo(f"\n  --- HIGH CONFIDENCE: fingerprinted SaaS target is NXDOMAIN ({len(takeover_candidates)}) ---")
+                click.echo(f"\n  --- HIGH CONFIDENCE: fingerprinted SaaS target is unclaimed ({len(takeover_candidates)}) ---")
                 for line in takeover_candidates:
                     click.echo(line)
             if fingerprinted_unconfirmed:
@@ -607,6 +777,11 @@ def main():
                 for line in unclassified_external:
                     click.echo(line)
 
+        if missing_secondary:
+            click.echo(f"\n=== Mail, SRV and SPF targets that do not exist (NXDOMAIN) ({len(missing_secondary)}) ===")
+            for line in missing_secondary:
+                click.echo(line)
+
         click.echo(f"\nTotal dangling DNS records found: {dangling_count}")
 
     if hidden_internal:
@@ -615,8 +790,17 @@ def main():
             "hidden \u2014 not takeover risks; use the dump file to see them)"
         )
 
+    if COLLECTION_ERRORS:
+        click.echo(
+            f"\nWARNING: the scan is incomplete \u2014 {len(COLLECTION_ERRORS)} collection error(s). "
+            "Missing inventory shows up as false positives above; missing DNS data hides real findings."
+        )
+        for (provider, what, error), count in _summarise_errors(COLLECTION_ERRORS):
+            suffix = f" (x{count})" if count > 1 else ""
+            click.echo(f"  {provider} {what}: {error}{suffix}")
+
     if args.json_file:
-        _write_json_report(args.json_file, findings, hidden_internal)
+        _write_json_report(args.json_file, findings, hidden_internal, COLLECTION_ERRORS)
 
     # Opt-in so a scheduled scan or CI job can fail on findings instead of
     # passing silently. Default stays 0 to keep existing callers working.
@@ -624,7 +808,16 @@ def main():
         sys.exit(1)
 
 
-def _write_json_report(path, findings, hidden_internal):
+def _summarise_errors(errors):
+    """Group identical failures (the same denied API in every region) into one line each."""
+    counts = {}
+    for e in errors:
+        key = (e["provider"], e["what"], e["error"])
+        counts[key] = counts.get(key, 0) + 1
+    return sorted(counts.items())
+
+
+def _write_json_report(path, findings, hidden_internal, collection_errors=()):
     """Write findings as JSON to a path, or to stdout when path is '-'."""
     report = {
         "tool": "findmytakeover",
@@ -637,7 +830,9 @@ def _write_json_report(path, findings, hidden_internal):
                 owner: sum(1 for f in findings if f["target_owner"] == owner)
                 for owner in sorted({f["target_owner"] for f in findings})
             },
+            "complete": not collection_errors,
         },
+        "collection_errors": list(collection_errors),
         "findings": findings,
     }
 

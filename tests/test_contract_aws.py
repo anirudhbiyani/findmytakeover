@@ -162,10 +162,18 @@ def test_ec2_describe_regions():
     _assert_output_path("ec2", "DescribeRegions", "Regions", LIST, "RegionName")
 
 
-def test_ec2_describe_instances():
-    base = ("Reservations", LIST, "Instances", LIST, "NetworkInterfaces", LIST, "Association")
-    _assert_output_path("ec2", "DescribeInstances", *base, "PublicIp")
-    _assert_output_path("ec2", "DescribeInstances", *base, "PublicDnsName")
+def test_ec2_describe_addresses():
+    _assert_output_path("ec2", "DescribeAddresses", "Addresses", LIST, "PublicIp")
+
+
+def test_ec2_describe_network_interfaces():
+    eni = ("NetworkInterfaces", LIST)
+    _assert_output_path("ec2", "DescribeNetworkInterfaces", *eni, "Association", "PublicIp")
+    _assert_output_path("ec2", "DescribeNetworkInterfaces", *eni, "Association", "PublicDnsName")
+    _assert_output_path(
+        "ec2", "DescribeNetworkInterfaces", *eni, "PrivateIpAddresses", LIST, "Association", "PublicIp"
+    )
+    _assert_output_path("ec2", "DescribeNetworkInterfaces", *eni, "Ipv6Addresses", LIST, "Ipv6Address")
 
 
 # ---------------------------------------------------------------------------
@@ -230,14 +238,40 @@ def test_opensearch_describe_domain():
 
 
 # ---------------------------------------------------------------------------
-# API Gateway v2 — manual NextToken pagination + endpoint
+# API Gateway v1 / v2 — API endpoints and custom domain targets
 # ---------------------------------------------------------------------------
+
+def test_apigateway_get_rest_apis():
+    _assert_output_path("apigateway", "GetRestApis", "items", LIST, "id")
+
+
+def test_apigateway_get_domain_names():
+    _assert_output_path("apigateway", "GetDomainNames", "items", LIST, "regionalDomainName")
+    _assert_output_path("apigateway", "GetDomainNames", "items", LIST, "distributionDomainName")
+
 
 def test_apigatewayv2_get_apis():
     _assert_output_path("apigatewayv2", "GetApis", "Items", LIST, "ApiEndpoint")
-    # Manual NextToken pagination (no boto3 paginator for GetApis) — the
-    # collector loops on this field itself, so it must keep existing.
-    _assert_output_path("apigatewayv2", "GetApis", "NextToken")
+
+
+def test_apigatewayv2_get_domain_names():
+    _assert_output_path(
+        "apigatewayv2", "GetDomainNames", "Items", LIST,
+        "DomainNameConfigurations", LIST, "ApiGatewayDomainName",
+    )
+
+
+# ---------------------------------------------------------------------------
+# Cognito — user pool hosted-UI domains
+# ---------------------------------------------------------------------------
+
+def test_cognito_user_pool_domains():
+    _assert_output_path("cognito-idp", "ListUserPools", "UserPools", LIST, "Id")
+    _assert_output_path("cognito-idp", "DescribeUserPool", "UserPool", "Domain")
+    _assert_output_path("cognito-idp", "DescribeUserPool", "UserPool", "CustomDomain")
+    _assert_output_path(
+        "cognito-idp", "DescribeUserPoolDomain", "DomainDescription", "CloudFrontDistribution"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -350,7 +384,8 @@ if __name__ == "__main__":
     test_cloudfront_list_distributions()
     test_globalaccelerator_list_accelerators()
     test_ec2_describe_regions()
-    test_ec2_describe_instances()
+    test_ec2_describe_addresses()
+    test_ec2_describe_network_interfaces()
     test_elb_describe_load_balancers()
     test_elbv2_describe_load_balancers()
     test_elasticbeanstalk_describe_applications()
@@ -358,7 +393,11 @@ if __name__ == "__main__":
     test_rds_describe_db_instances()
     test_opensearch_list_domain_names()
     test_opensearch_describe_domain()
+    test_apigateway_get_rest_apis()
+    test_apigateway_get_domain_names()
     test_apigatewayv2_get_apis()
+    test_apigatewayv2_get_domain_names()
+    test_cognito_user_pool_domains()
     test_lambda_list_functions()
     test_lambda_get_function_url_config()
     test_eks_list_clusters()

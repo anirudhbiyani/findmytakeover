@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 
-from azure.core.exceptions import HttpResponseError
+from azure.core.exceptions import AzureError, HttpResponseError
 from azure.mgmt.dns import DnsManagementClient
-from azure.identity import ClientSecretCredential, DefaultAzureCredential
+from azure.identity import AzureAuthorityHosts, ClientSecretCredential, DefaultAzureCredential
 # Keep the submodule path: azure-mgmt-resource 26.x turned the parent into a
 # namespace package with no top-level re-export, so the short import breaks on
 # the next dependabot bump. This path works on both 25.x and 26.x.
@@ -25,9 +25,31 @@ from azure.mgmt.appcontainers import ContainerAppsAPIClient
 from azure.mgmt.cosmosdb import CosmosDBManagementClient
 import click
 
-from collector import is_cloud_nameserver, zone_key
+from collector import is_cloud_nameserver, note_error, secondary_targets, zone_key
+
+_PROVIDER = "Microsoft Azure"
 
 _USE_CLI_CREDS = "default"
+
+# `cloud:` config value (the names `az cloud list` uses) → (login authority,
+# Resource Manager endpoint). Every client and credential is pointed at both.
+_CLOUDS = {
+    "azurecloud": (AzureAuthorityHosts.AZURE_PUBLIC_CLOUD, "https://management.azure.com"),
+    "azureusgovernment": (AzureAuthorityHosts.AZURE_GOVERNMENT, "https://management.usgovcloudapi.net"),
+}
+
+
+def _cloud(name):
+    """Resolve a `cloud:` config value, defaulting to the public cloud."""
+    key = str(name or "AzureCloud").replace(" ", "").lower()
+    if key not in _CLOUDS:
+        raise ValueError(f"Unknown Azure cloud {name!r}; use AzureCloud or AzureUSGovernment")
+    return _CLOUDS[key]
+
+
+def _arm(endpoint):
+    """Client kwargs that send Resource Manager calls (and token requests) to `endpoint`."""
+    return {"base_url": endpoint, "credential_scopes": [f"{endpoint}/.default"]}
 
 
 def _strip_protocol(url):
@@ -37,22 +59,34 @@ def _strip_protocol(url):
     return url.removeprefix("https://").removeprefix("http://").rstrip("/")
 
 
+def _secondary_rdata(record):
+    """(type, presentation-format rdata) pairs for a record set's MX/SRV/TXT records."""
+    for mx in record.mx_records or []:
+        yield "MX", f"{mx.preference} {mx.exchange}"
+    for srv in record.srv_records or []:
+        yield "SRV", f"{srv.priority} {srv.weight} {srv.port} {srv.target}"
+    for txt in record.txt_records or []:
+        # Azure splits long TXT values into 255-byte chunks; rejoin them.
+        yield "TXT", "".join(txt.value or [])
+
+
 def _is_default_credentials(cred):
     return isinstance(cred, str) and cred.strip().lower() == _USE_CLI_CREDS
 
 
-def _load_credentials(cred):
+def _load_credentials(cred, authority):
     """Return Azure credentials from explicit config or local CLI session."""
     if _is_default_credentials(cred):
-        return DefaultAzureCredential()
+        return DefaultAzureCredential(authority=authority)
     return ClientSecretCredential(
         cred["AZURE_TENANT_ID"],
         cred["AZURE_CLIENT_ID"],
         cred["AZURE_CLIENT_SECRET"],
+        authority=authority,
     )
 
 
-def _resolve_subscriptions(accounts, credentials, use_default):
+def _resolve_subscriptions(accounts, credentials, use_default, endpoint):
     """Return the subscription list, auto-discovering via SubscriptionClient when using default credentials."""
     if not use_default:
         return accounts
@@ -60,7 +94,7 @@ def _resolve_subscriptions(accounts, credentials, use_default):
     if accounts:
         return accounts
 
-    sub_client = SubscriptionClient(credentials)
+    sub_client = SubscriptionClient(credentials, **_arm(endpoint))
     discovered = [
         sub.subscription_id
         for sub in sub_client.subscriptions.list()
@@ -72,18 +106,19 @@ def _resolve_subscriptions(accounts, credentials, use_default):
 
 class azure:
     @staticmethod
-    def dns(accounts, cred):
+    def dns(accounts, cred, cloud=None):
         """Collect DNS records from Azure subscriptions."""
-        credentials = _load_credentials(cred)
-        accounts = _resolve_subscriptions(accounts, credentials, _is_default_credentials(cred))
+        authority, endpoint = _cloud(cloud)
+        credentials = _load_credentials(cred, authority)
+        accounts = _resolve_subscriptions(accounts, credentials, _is_default_credentials(cred), endpoint)
         dnsdata = []
 
         for subscription in accounts:
             click.echo(f"Reading DNS data from Azure Subscription - {subscription}")
 
             try:
-                resourcegroup_client = ResourceManagementClient(credentials, subscription)
-                dns_client = DnsManagementClient(credentials, subscription)
+                resourcegroup_client = ResourceManagementClient(credentials, subscription, **_arm(endpoint))
+                dns_client = DnsManagementClient(credentials, subscription, **_arm(endpoint))
 
                 for rg in resourcegroup_client.resource_groups.list():
                     for zone in dns_client.zones.list_by_resource_group(
@@ -123,19 +158,22 @@ class azure:
                                 nameservers = [ns.nsdname for ns in record.ns_records]
                                 if any(is_cloud_nameserver(ns) for ns in nameservers):
                                     dnsdata.append([subscription, fqdn, zone_key(fqdn)])
-            except HttpResponseError as e:
-                if "AuthorizationFailed" in str(e):
-                    click.echo(f"Skipping subscription {subscription} - authorization failed")
-                else:
-                    raise
+                            dnsdata.extend(
+                                [subscription, fqdn, target, rtype]
+                                for rtype, rdata in _secondary_rdata(record)
+                                for target in secondary_targets(rtype, rdata)
+                            )
+            except AzureError as e:
+                note_error(_PROVIDER, subscription, "DNS records", e)
 
         return dnsdata
 
     @staticmethod
-    def infra(accounts, cred):
+    def infra(accounts, cred, cloud=None):
         """Collect infrastructure data from Azure subscriptions."""
-        credentials = _load_credentials(cred)
-        accounts = _resolve_subscriptions(accounts, credentials, _is_default_credentials(cred))
+        authority, endpoint = _cloud(cloud)
+        credentials = _load_credentials(cred, authority)
+        accounts = _resolve_subscriptions(accounts, credentials, _is_default_credentials(cred), endpoint)
         infradata = []
 
         for subscription in accounts:
@@ -145,7 +183,7 @@ class azure:
 
             try:
                 # Initialize all clients once per subscription
-                clients = _create_azure_clients(credentials, subscription)
+                clients = _create_azure_clients(credentials, subscription, endpoint)
 
                 # Azure Functions / Web Apps (subscription-wide, no need to iterate per RG)
                 for app in clients["web"].web_apps.list():
@@ -262,7 +300,13 @@ class azure:
                     for search in clients["search"].services.list_by_resource_group(
                         resource_group_name=rg_name
                     ):
-                        if search.name:
+                        # The endpoint differs by cloud (search.windows.net,
+                        # search.azure.us), so prefer the one the API reports.
+                        if search.endpoint:
+                            infradata.append(
+                                [subscription, "cognitivesearch", _strip_protocol(search.endpoint)]
+                            )
+                        elif search.name:
                             infradata.append(
                                 [
                                     subscription,
@@ -311,35 +355,38 @@ class azure:
                         clients["cosmosdb"], subscription, rg_name, infradata
                     )
 
-            except HttpResponseError as e:
-                if "AuthorizationFailed" in str(e):
-                    click.echo(f"Skipping subscription {subscription} - authorization failed")
-                else:
-                    raise
+            except AzureError as e:
+                note_error(_PROVIDER, subscription, "infrastructure", e)
 
         return infradata
 
 
-def _create_azure_clients(credentials, subscription):
-    """Create all Azure management clients for a subscription."""
+_CLIENT_CLASSES = {
+    "resource": ResourceManagementClient,
+    "dns": DnsManagementClient,
+    "network": NetworkManagementClient,
+    "cdn": CdnManagementClient,
+    "traffic": TrafficManagerManagementClient,
+    "web": WebSiteManagementClient,
+    "storage": StorageManagementClient,
+    "api": ApiManagementClient,
+    "sql": SqlManagementClient,
+    "ecr": ContainerRegistryManagementClient,
+    "container": ContainerInstanceManagementClient,
+    "search": SearchManagementClient,
+    "redis": RedisManagementClient,
+    "compute": ComputeManagementClient,
+    "aks": ContainerServiceClient,
+    "containerapps": ContainerAppsAPIClient,
+    "cosmosdb": CosmosDBManagementClient,
+}
+
+
+def _create_azure_clients(credentials, subscription, endpoint="https://management.azure.com"):
+    """Create all Azure management clients for a subscription, all aimed at one cloud."""
     return {
-        "resource": ResourceManagementClient(credentials, subscription),
-        "dns": DnsManagementClient(credentials, subscription),
-        "network": NetworkManagementClient(credentials, subscription),
-        "cdn": CdnManagementClient(credentials, subscription),
-        "traffic": TrafficManagerManagementClient(credentials, subscription),
-        "web": WebSiteManagementClient(credentials, subscription),
-        "storage": StorageManagementClient(credentials, subscription),
-        "api": ApiManagementClient(credentials, subscription),
-        "sql": SqlManagementClient(credentials, subscription),
-        "ecr": ContainerRegistryManagementClient(credentials, subscription),
-        "container": ContainerInstanceManagementClient(credentials, subscription),
-        "search": SearchManagementClient(credentials, subscription),
-        "redis": RedisManagementClient(credentials, subscription),
-        "compute": ComputeManagementClient(credentials, subscription),
-        "aks": ContainerServiceClient(credentials, subscription),
-        "containerapps": ContainerAppsAPIClient(credentials, subscription),
-        "cosmosdb": CosmosDBManagementClient(credentials, subscription),
+        name: cls(credentials, subscription, **_arm(endpoint))
+        for name, cls in _CLIENT_CLASSES.items()
     }
 
 

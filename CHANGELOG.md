@@ -8,7 +8,7 @@ the project aims to follow [Semantic Versioning](https://semver.org/spec/v2.0.0.
 Entries for 1.x predate this file and were reconstructed from git history, so
 they summarise the shape of each release rather than listing every commit.
 
-## [Unreleased]
+## [3.0.0] — 2026-10-31
 
 ### Changed
 
@@ -16,11 +16,51 @@ they summarise the shape of each release rather than listing every commit.
   `python:3.14-alpine`. Still runs as non-root uid 65532 with
   `HOME=/home/nonroot`, so existing credential mounts are unchanged.
 
+### Added
+
+- **AWS GovCloud and Azure Government.** AWS derives the partition from the
+  profile's region (role ARNs, STS endpoint, skipping CloudFront and Global
+  Accelerator where they don't exist). Azure takes `cloud: AzureUSGovernment`
+  and points every client and credential at the Government endpoints. Azure
+  Government DNS and endpoint domains are recognised as Azure.
+- **MX, SRV and SPF records.** Their targets are diffed against inventory; a
+  third-party target is reported only when it returns NXDOMAIN
+  (`confidence: target-nxdomain`).
+- **`--verify-http`** (opt-in) confirms wildcard-DNS SaaS takeovers by matching
+  the provider's "no such site" page.
+- **More AWS inventory**: every Elastic IP and every public IPv4/IPv6 on any
+  network interface (NAT gateways, NLBs, ECS tasks, ...), API Gateway REST APIs
+  and custom domain targets (v1 and v2), and Cognito hosted-UI domains.
+- **Incomplete-scan reporting.** A failed API call is recorded instead of
+  aborting or being swallowed; the console ends with a warning and the JSON
+  report gains `summary.complete` and `collection_errors`.
+- SaaS fingerprints synced with can-i-take-over-xyz (17 services added).
+
+### Changed
+
+- **Python 3.12 or newer is required** (was 3.11). CI tests 3.12, 3.14 and 3.15.
+- `exclude.domains` matches DNS suffixes instead of substrings.
+- Fastly, Zendesk, Statuspage, Unbounce and Desk are no longer fingerprinted:
+  they verify domain ownership, so they were never claimable.
+- `--dump-file` overwrites instead of appending to earlier runs.
+- JSON findings gain `record_type` and `http_status`.
+
 ### Fixed
 
 - Match cloud targets and nameservers by DNS suffix boundaries, preventing
   provider-looking substrings in unrelated hostnames from being classified as
   cloud infrastructure.
+- Route 53 alias records (`dualstack.` prefix, trailing dot, mixed case) never
+  matched the live ELB or CloudFront they point at, so every alias was reported
+  as dangling.
+- Records pointing at S3 endpoints never matched the bucket inventory; S3
+  hostnames (including website and dual-stack endpoints) now reduce to the
+  bucket name.
+- One denied or failing AWS API call aborted collection for the whole run; each
+  service now fails on its own. Any provider failing outright no longer takes
+  the others down with it.
+- An empty config file crashed with a `TypeError`.
+- The README pointed at a `demo/` directory that doesn't exist.
 
 ## [2.0.0] — 2026-08-04
 

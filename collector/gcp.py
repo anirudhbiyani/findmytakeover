@@ -18,7 +18,16 @@ from google.cloud import container_v1
 from google.cloud import artifactregistry_v1
 import click
 
-from collector import is_cloud_nameserver, zone_key, MAX_WORKERS
+from collector import (
+    MAX_WORKERS,
+    SECONDARY_RECORD_TYPES,
+    is_cloud_nameserver,
+    note_error,
+    secondary_targets,
+    zone_key,
+)
+
+_PROVIDER = "Google Cloud Platform"
 
 # Record types we're interested in for DNS
 _A_AAAA_TYPES = frozenset(("A", "AAAA"))
@@ -146,9 +155,15 @@ def _dns_for_project(proj, credentials):
                     # delegated zone is not in the inventory (see infra()).
                     if any(is_cloud_nameserver(ns) for ns in record_set.rrdatas):
                         dnsdata.append([proj, record_name, zone_key(record_name)])
+                elif record_type in SECONDARY_RECORD_TYPES:
+                    dnsdata.extend(
+                        [proj, record_name, target, record_type]
+                        for rdata in record_set.rrdatas
+                        for target in secondary_targets(record_type, rdata)
+                    )
     except Forbidden as e:
         if not _api_disabled(e):
-            click.echo(f"Skipping DNS collection for project {proj} - access denied")
+            note_error(_PROVIDER, proj, "DNS collection", e)
 
     return dnsdata
 
@@ -165,7 +180,7 @@ def _infra_for_project(proj, credentials):
             infradata.append([proj, "dnszone", zone_key(managed_zone.dns_name)])
     except Forbidden as e:
         if not _api_disabled(e):
-            click.echo(f"Skipping DNS zones for project {proj} - access denied")
+            note_error(_PROVIDER, proj, "DNS zones", e)
 
     # Cloud Storage Buckets
     try:
@@ -176,7 +191,7 @@ def _infra_for_project(proj, credentials):
         )
     except Forbidden as e:
         if not _api_disabled(e):
-            click.echo(f"Skipping Storage for project {proj} - access denied")
+            note_error(_PROVIDER, proj, "Storage", e)
 
     # LoadBalancer IP Addresses
     try:
@@ -189,7 +204,7 @@ def _infra_for_project(proj, credentials):
                 )
     except Forbidden as e:
         if not _api_disabled(e):
-            click.echo(f"Skipping Forwarding Rules for project {proj} - access denied")
+            note_error(_PROVIDER, proj, "Forwarding Rules", e)
 
     # Cloud Functions
     try:
@@ -203,7 +218,7 @@ def _infra_for_project(proj, credentials):
                 infradata.append([proj, "cloudfunction", uri.removeprefix("https://")])
     except Forbidden as e:
         if not _api_disabled(e):
-            click.echo(f"Skipping Cloud Functions for project {proj} - access denied")
+            note_error(_PROVIDER, proj, "Cloud Functions", e)
 
     # Virtual Machines - collect public IPs
     try:
@@ -220,7 +235,7 @@ def _infra_for_project(proj, credentials):
                         )
     except Forbidden as e:
         if not _api_disabled(e):
-            click.echo(f"Skipping Compute Instances for project {proj} - access denied")
+            note_error(_PROVIDER, proj, "Compute Instances", e)
 
     # Cloud Run services
     try:
@@ -239,7 +254,7 @@ def _infra_for_project(proj, credentials):
                 continue
     except Forbidden as e:
         if not _api_disabled(e):
-            click.echo(f"Skipping Cloud Run for project {proj} - access denied")
+            note_error(_PROVIDER, proj, "Cloud Run", e)
 
     # App Engine default service hostname (one application per project, if any)
     try:
@@ -252,7 +267,7 @@ def _infra_for_project(proj, credentials):
         pass  # No App Engine application in this project - not an error.
     except Forbidden as e:
         if not _api_disabled(e):
-            click.echo(f"Skipping App Engine for project {proj} - access denied")
+            note_error(_PROVIDER, proj, "App Engine", e)
 
     # GKE cluster control-plane endpoints
     try:
@@ -263,7 +278,7 @@ def _infra_for_project(proj, credentials):
                 infradata.append([proj, "gke", cluster.endpoint])
     except Forbidden as e:
         if not _api_disabled(e):
-            click.echo(f"Skipping GKE for project {proj} - access denied")
+            note_error(_PROVIDER, proj, "GKE", e)
 
     # Artifact Registry repository hostnames (e.g. REGION-docker.pkg.dev)
     try:
@@ -277,7 +292,7 @@ def _infra_for_project(proj, credentials):
                     infradata.append([proj, "artifactregistry", host])
     except Forbidden as e:
         if not _api_disabled(e):
-            click.echo(f"Skipping Artifact Registry for project {proj} - access denied")
+            note_error(_PROVIDER, proj, "Artifact Registry", e)
 
     # Cloud SQL public instance IPs. There's no stable google-cloud-* client
     # for the SQL Admin API, so we call the REST API directly via an
@@ -293,7 +308,7 @@ def _infra_for_project(proj, credentials):
                 body = resp.json() if resp.content else {}
                 message = body.get("error", {}).get("message", "")
                 if not _api_disabled(message):
-                    click.echo(f"Skipping Cloud SQL for project {proj} - access denied")
+                    note_error(_PROVIDER, proj, "Cloud SQL", message or "403 access denied")
                 break
             resp.raise_for_status()
             body = resp.json()
@@ -305,6 +320,6 @@ def _infra_for_project(proj, credentials):
             if not page_token:
                 break
     except requests.RequestException as e:
-        click.echo(f"Skipping Cloud SQL for project {proj} - request failed: {e}")
+        note_error(_PROVIDER, proj, "Cloud SQL", e)
 
     return infradata

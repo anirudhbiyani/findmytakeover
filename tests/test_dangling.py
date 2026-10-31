@@ -148,11 +148,14 @@ def test_identify_service():
     assert identify_service("APP.HEROKUAPP.COM") == "Heroku"
     assert identify_service("shop.myshopify.com") == "Shopify"
     assert identify_service("site.netlify.app") == "Netlify"
-    assert identify_service("cdn.fastly.net") == "Fastly"
-    assert identify_service("help.zendesk.com") == "Zendesk"
     assert identify_service("docs.readme.io") == "Readme"
-    assert identify_service("status.statuspage.io") == "Statuspage"
     assert identify_service("repo.bitbucket.io") == "Bitbucket"
+    assert identify_service("blog.wordpress.com") == "WordPress.com"
+    assert identify_service("x.trydiscourse.com") == "Discourse"
+    # can-i-take-over-xyz lists these as not vulnerable (they verify ownership).
+    assert identify_service("cdn.fastly.net") is None
+    assert identify_service("help.zendesk.com") is None
+    assert identify_service("status.statuspage.io") is None
     # Bare hostname equal to the fingerprinted suffix also matches.
     assert identify_service("herokudns.com") == "Heroku"
     # Not a SaaS fingerprint: unknown third party, and first-party cloud
@@ -284,3 +287,221 @@ def test_json_report_shape():
     assert report["summary"]["hidden_internal"] == 3
     assert report["summary"]["by_target_owner"]["External"] == 1
     assert len(report["findings"]) == 2
+
+
+def test_alias_s3_and_ipv6_values_match_inventory():
+    records = [
+        # Route 53 alias: dualstack. prefix, trailing dot, mixed case.
+        ["aws", "1", "www.example.com.", "dualstack.My-LB-1.us-east-1.elb.amazonaws.com."],
+        ["aws", "1", "cdn.example.com.", "d111.cloudfront.net."],
+        # S3 endpoints reduce to the bucket name, which may itself contain dots.
+        ["aws", "1", "site.example.com.", "site.example.com.s3-website-us-east-1.amazonaws.com"],
+        ["aws", "1", "assets.example.com.", "assets.s3.dualstack.us-gov-west-1.amazonaws.com"],
+        ["aws", "1", "gone.example.com.", "deleted-bucket.s3.amazonaws.com"],
+        # The same IPv6 address, spelled two ways.
+        ["aws", "1", "v6.example.com.", "2001:DB8:0:0:0:0:0:1"],
+    ]
+    infra = [
+        ["aws", "1", "elbv2", "my-lb-1.us-east-1.elb.amazonaws.com"],
+        ["aws", "1", "cloudfront", "d111.cloudfront.net"],
+        ["aws", "1", "s3", "site.example.com"],
+        ["aws", "1", "s3", "assets"],
+        ["aws", "1", "public-ip", "2001:db8::1"],
+    ]
+    assert _dangling_values(records, infra) == {"deleted-bucket.s3.amazonaws.com"}
+
+
+def test_exclusions_match_dns_suffixes_not_substrings():
+    ex = findmytakeover._parse_exclusions({"exclude": {"domains": ["example.com"]}})
+    assert ex.matches("a.EXAMPLE.com.")
+    assert ex.matches("example.com")
+    assert not ex.matches("notexample.com")
+    assert not ex.matches("example.com.attacker.example")
+
+
+def test_secondary_targets():
+    from collector import secondary_targets
+
+    assert secondary_targets("MX", "10 mx.Example.com.") == ["mx.example.com"]
+    assert secondary_targets("MX", "mx.example.com") == ["mx.example.com"]  # Cloudflare: no priority
+    assert secondary_targets("MX", "0 .") == []  # null MX
+    assert secondary_targets("SRV", "1 10 5060 sip.example.com.") == ["sip.example.com"]
+    spf = '"v=spf1 ip4:192.0.2.0/24 include:_spf.google.com -include:mail.zendesk.com" " ~include:%{i}.x.example redirect=spf.example.net"'
+    assert secondary_targets("TXT", spf) == ["_spf.google.com", "mail.zendesk.com", "spf.example.net"]
+    # A TXT value split into 255-byte chunks mid-token is rejoined first.
+    assert secondary_targets("TXT", '"v=spf1 incl" "ude:a.example.com"') == ["a.example.com"]
+    assert secondary_targets("TXT", '"google-site-verification=abc"') == []
+    assert secondary_targets("TXT", "v=spf1 -all") == []
+
+
+def test_secondary_records_reported_only_when_target_is_gone():
+    records = [
+        ["aws", "1", "example.com.", "aspmx.l.google.com", "MX"],
+        ["aws", "1", "example.com.", "expired-mailhost.example", "MX"],
+        ["aws", "1", "example.com.", "x.us-east-1.elb.amazonaws.com", "MX"],
+    ]
+    result = _find_dangling_records(
+        pd.DataFrame(records, columns=RECORD_COLS + ["rtype"]),
+        pd.DataFrame([], columns=INFRA_COLS),
+        exclusions=set(),
+    )
+    # All three miss inventory; main() keeps the cloud one as an inventory-miss
+    # and resolves the third-party ones, reporting only NXDOMAIN targets.
+    assert set(result["rtype"]) == {"MX"}
+    assert _classify_target("aspmx.l.google.com") == "External"
+    assert _classify_target("x.us-east-1.elb.amazonaws.com") == "Amazon Web Services"
+
+
+def test_us_government_names():
+    assert is_cloud_nameserver("ns1-08.azuregov-dns.us.")
+    for host in ("x.usgovcloudapi.net", "app.azurewebsites.us", "p.usgovtrafficmanager.net",
+                 "r.azurecr.us", "s.search.azure.us", "f.azurefd.us"):
+        assert _classify_target(host) == "Microsoft Azure", host
+    assert _classify_target("x.execute-api.us-gov-west-1.amazonaws.com") == "Amazon Web Services"
+    assert _classify_target("auth.auth.us-east-1.amazoncognito.com") == "Amazon Web Services"
+
+
+def test_parse_providers_cloud_option():
+    providers = _parse_providers(
+        {"dns": {"azure": {"enabled": True, "credentials": "default", "cloud": "AzureUSGovernment"}}}, "dns"
+    )
+    assert providers["azure"]["options"] == {"cloud": "AzureUSGovernment"}
+    try:
+        _parse_providers({"dns": {"aws": {"enabled": True, "credentials": "default", "cloud": "x"}}}, "dns")
+    except SystemExit:
+        pass
+    else:
+        raise AssertionError("cloud: on a non-Azure provider must be rejected")
+
+
+def test_empty_config_file_exits_cleanly():
+    import tempfile
+
+    with tempfile.NamedTemporaryFile("w", suffix=".config", delete=False) as fh:
+        path = fh.name
+    try:
+        findmytakeover.read_config(path)
+    except SystemExit as e:
+        assert e.code == 1
+    else:
+        raise AssertionError("an empty config must exit, not crash")
+    finally:
+        os.unlink(path)
+
+
+def test_collection_errors_reported():
+    import json as _json
+    import tempfile
+
+    errors = [
+        {"provider": "Amazon Web Services", "scope": "1/us-east-1", "what": "rds", "error": "AccessDenied"},
+        {"provider": "Amazon Web Services", "scope": "1/eu-west-1", "what": "rds", "error": "AccessDenied"},
+    ]
+    assert findmytakeover._summarise_errors(errors) == [
+        (("Amazon Web Services", "rds", "AccessDenied"), 2)
+    ]
+    with tempfile.TemporaryDirectory() as d:
+        path = os.path.join(d, "report.json")
+        findmytakeover._write_json_report(path, [], 0, errors)
+        with open(path) as fh:
+            report = _json.load(fh)
+    assert report["summary"]["complete"] is False
+    assert len(report["collection_errors"]) == 2
+
+
+def test_http_fingerprint_status():
+    from collector.fingerprints import http_fingerprint
+
+    class _Raw:
+        def __init__(self, body):
+            self.body = body
+
+        def read(self, n, decode_content=True):
+            return self.body[:n]
+
+    class _Response:
+        encoding = "utf-8"
+
+        def __init__(self, body):
+            self.raw = _Raw(body)
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+    class _Session:
+        def __init__(self, pages):
+            self.pages = pages
+
+        def get(self, url, **kwargs):
+            page = self.pages.get(url)
+            if page is None:
+                raise ConnectionError(url)
+            return _Response(page)
+
+    pattern = http_fingerprint("GitHub Pages")
+    gone = _Session({"https://docs.example.com": b"<h1>There isn't a GitHub Pages site here.</h1>"})
+    live = _Session({"https://docs.example.com": b"<h1>Docs</h1>"})
+    http_only = _Session({"http://docs.example.com": b"There isn't a GitHub Pages site here."})
+    status = findmytakeover._http_fingerprint_status
+    assert status(gone, "docs.example.com", pattern) == "matched"
+    assert status(live, "docs.example.com", pattern) == "no-match"
+    assert status(http_only, "docs.example.com", pattern) == "matched"
+    assert status(_Session({}), "docs.example.com", pattern) == "unknown"
+    assert http_fingerprint("Unknown service") is None
+
+
+def test_aws_region_collectors_are_isolated():
+    from botocore.exceptions import ClientError, EndpointConnectionError
+
+    import collector
+    from collector import aws
+
+    def denied(make):
+        raise ClientError({"Error": {"Code": "AccessDenied", "Message": "no"}}, "Describe")
+        yield
+
+    def not_offered(make):
+        raise EndpointConnectionError(endpoint_url="https://x")
+        yield
+
+    def works(make):
+        yield "lb.example.elb.amazonaws.com"
+        yield None
+
+    original = aws._REGIONAL_COLLECTORS
+    collector.COLLECTION_ERRORS.clear()
+    aws._REGIONAL_COLLECTORS = (("a", denied), ("b", not_offered), ("c", works))
+    try:
+        rows = aws._collect_region_infra("111122223333", "default", "us-east-1")
+    finally:
+        aws._REGIONAL_COLLECTORS = original
+    errors = list(collector.COLLECTION_ERRORS)
+    collector.COLLECTION_ERRORS.clear()
+    assert rows == [["111122223333", "c", "lb.example.elb.amazonaws.com"]]
+    # A denied API is a gap worth reporting; a service absent from the region isn't.
+    assert [(e["what"], e["error"]) for e in errors] == [("a", "An error occurred (AccessDenied) when calling the Describe operation: no")]
+
+
+def test_aws_govcloud_partition():
+    from collector import aws
+
+    assert aws._partition("us-gov-west-1") == "aws-us-gov"
+    assert aws._partition("us-east-1") == "aws"
+    assert not aws._offered_in("cloudfront", "us-gov-west-1")
+    assert aws._offered_in("cloudfront", "us-east-1")
+
+
+def test_s3_hostname_regex_is_linear():
+    import time
+
+    from findmytakeover import _S3_HOSTNAME, _match_key
+
+    assert _match_key("b.s3-website.us-east-1.amazonaws.com") == "b"
+    assert _match_key("my-bucket.s3.amazonaws.com") == "my-bucket"
+    # CodeQL ReDoS reproducer: overlapping "-" handling made this exponential.
+    start = time.monotonic()
+    assert _S3_HOSTNAME.match("a.s3-" + "--" * 5000 + "!") is None
+    assert time.monotonic() - start < 1.0
