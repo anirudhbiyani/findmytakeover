@@ -7,7 +7,9 @@
 # - Each new finding opens a GitHub issue (label: dangling-dns); the issue is
 #   closed when the finding disappears. A scan that couldn't read everything
 #   opens one "scan incomplete" issue instead of failing silently.
-# - Optional Slack post for new high-confidence findings.
+# - Optional chat/webhook alerts sent by findmytakeover itself
+#   (FINDMYTAKEOVER_ALERT_WEBHOOKS secret: Slack incoming webhooks get a Slack
+#   message, any other URL — Teams via Power Automate, a SIEM — gets JSON).
 name: Dangling DNS scan
 
 on:
@@ -30,7 +32,6 @@ jobs:
     runs-on: ubuntu-latest
     env:
       GH_TOKEN: ${{ github.token }}
-      SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}   # optional
     steps:
       - uses: actions/checkout@v5
 
@@ -73,6 +74,10 @@ jobs:
       # the report is still uploaded and alerts still go out.
       - name: Scan
         id: scan
+        env:
+          # Space-separated webhook URLs; alerts on new actionable findings and
+          # on an incomplete scan. Empty = no webhook alerts.
+          FINDMYTAKEOVER_ALERT_WEBHOOKS: ${{ secrets.FINDMYTAKEOVER_ALERT_WEBHOOKS }}
         run: |
           set +e
           findmytakeover -c findmytakeover.config \
@@ -130,16 +135,6 @@ jobs:
           elif [ -n "$number" ]; then
             gh issue close "$number" --comment "Scan complete again in run $GITHUB_RUN_ID."
           fi
-
-      # --- Alerting: Slack (optional) --------------------------------------------
-      - name: Notify Slack of new high-confidence findings
-        if: always() && hashFiles('findings.json') != '' && env.SLACK_WEBHOOK_URL != ''
-        run: |
-          text=$(jq -r '[.findings[] | select(.new and .confidence == "high")]
-                        | select(length > 0)
-                        | "New likely subdomain takeovers:\n" + (map("• \(.record) -> \(.target) (\(.saas_service // .target_owner))") | join("\n"))' findings.json)
-          [ -z "$text" ] && exit 0
-          jq -n --arg text "$text" '{text: $text}' | curl -fsS -X POST -H 'Content-Type: application/json' --data @- "$SLACK_WEBHOOK_URL"
 
       - name: Fail the run on new findings or an incomplete scan
         if: always() && steps.scan.outputs.status != '0'

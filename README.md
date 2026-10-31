@@ -52,7 +52,8 @@ usage: findmytakeover [-h] [-c CONFIG_FILE] [-d DUMP_FILE]
                       [--verify-dns | --no-verify-dns] [--json JSON_FILE]
                       [--fail-on-findings] [--verify-http]
                       [--baseline JSON_FILE] [--fail-on-incomplete]
-                      [--version]
+                      [--alert-webhook URL]
+                      [--alert-confidence ALERT_CONFIDENCE] [--version]
 
 Find dangling DNS records that may be vulnerable to subdomain takeover
 
@@ -87,6 +88,16 @@ options:
   --fail-on-incomplete  Exit with status 2 when part of the scan couldn't be
                         collected (a denied API, an unreachable account),
                         unless status 1 already applies.
+  --alert-webhook URL   POST an alert to this webhook when there's something
+                        to act on (repeatable). Slack incoming webhooks get a
+                        Slack message; any other URL gets JSON. Prefer the
+                        FINDMYTAKEOVER_ALERT_WEBHOOKS environment variable
+                        (space-separated) so URLs stay out of process lists
+                        and CI logs.
+  --alert-confidence ALERT_CONFIDENCE
+                        Comma-separated confidence levels that alert, or 'all'
+                        (default: high,inventory-miss,target-nxdomain). With
+                        --baseline only new findings alert.
   --version             show program's version number and exit
 ```
 
@@ -176,12 +187,41 @@ ready-to-copy GitHub Actions workflow for a repository that holds your config:
 - opens a GitHub issue (label `dangling-dns`) per new finding and closes it
   when the finding disappears;
 - keeps one "scan incomplete" issue open while permissions are missing;
-- optionally posts new high-confidence findings to Slack
-  (`SLACK_WEBHOOK_URL` secret);
+- optionally sends [alerts](#alerts) to Slack or any webhook
+  (`FINDMYTAKEOVER_ALERT_WEBHOOKS` secret);
 - fails the run on new findings or an incomplete scan.
 
 The scan needs your cloud credentials, so it belongs in your own repository,
 not this one.
+
+### Alerts
+
+findmytakeover can post alerts itself. Give it one or more webhook URLs,
+preferably through the environment so they stay out of process lists and CI
+logs:
+
+```
+export FINDMYTAKEOVER_ALERT_WEBHOOKS="https://hooks.slack.com/services/T000/B000/XXXX"
+findmytakeover --json findings.json --baseline previous/findings.json
+```
+
+(`--alert-webhook URL`, repeatable, works too.)
+
+- **Slack** incoming webhooks (`hooks.slack.com`) get a readable message.
+- **Any other URL** gets the alert as JSON — `findings`, `complete` and
+  grouped `collection_errors` — for a Teams channel via a Power Automate
+  "When a webhook request is received" flow, a SIEM, or your own handler.
+
+What alerts:
+
+- findings whose confidence is `high`, `inventory-miss` or `target-nxdomain`
+  (change with `--alert-confidence`, or `--alert-confidence all`) — only the
+  **new** ones when `--baseline` is used;
+- an incomplete scan, even with no findings, because it quietly weakens every
+  other result.
+
+Nothing to act on means no message. A failed delivery prints a warning (with
+the host only, never the URL) and doesn't change the exit status.
 
 ### Output
 
