@@ -8,6 +8,20 @@ the project aims to follow [Semantic Versioning](https://semver.org/spec/v2.0.0.
 Entries for 1.x predate this file and were reconstructed from git history, so
 they summarise the shape of each release rather than listing every commit.
 
+## [Unreleased]
+
+### Added
+
+- **`--baseline FILE`** compares a scan with a previous `--json` report: each
+  finding is marked `new`, disappeared findings are listed under `resolved`,
+  and `--fail-on-findings` fails only on new findings.
+- **`--fail-on-incomplete`** exits with status 2 when part of the scan couldn't
+  be collected (status 1 for findings still takes precedence).
+- **`examples/github-actions-daily.yml`**: a daily scheduled scan with OIDC
+  cloud credentials, the previous run as baseline, a GitHub issue per new
+  finding (closed when it's resolved), a standing "scan incomplete" issue, and
+  optional Slack alerts.
+
 ## [3.0.0] — 2026-10-31
 
 ### Changed

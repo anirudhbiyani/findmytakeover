@@ -505,3 +505,87 @@ def test_s3_hostname_regex_is_linear():
     start = time.monotonic()
     assert _S3_HOSTNAME.match("a.s3-" + "--" * 5000 + "!") is None
     assert time.monotonic() - start < 1.0
+
+
+def _finding(record, target, record_type=None, confidence="inventory-miss"):
+    return {"record": record, "record_type": record_type, "target": target,
+            "target_owner": "External", "confidence": confidence}
+
+
+def test_compare_with_baseline():
+    baseline = [
+        _finding("a.example.com", "gone.github.io"),
+        _finding("fixed.example.com", "old.herokuapp.com"),
+        _finding("example.com", "mx.dead.example", "MX"),
+    ]
+    findings = [
+        # Same finding; confidence changing between runs doesn't make it new.
+        _finding("A.example.com.", "gone.github.io.", confidence="high"),
+        _finding("b.example.com", "x.netlify.app"),
+        # Same record and target but a different type is a different finding.
+        _finding("example.com", "mx.dead.example", "TXT"),
+    ]
+    diff = findmytakeover._compare_with_baseline(findings, baseline)
+    assert [f["new"] for f in findings] == [False, True, True]
+    assert [f["record"] for f in diff["new"]] == ["b.example.com", "example.com"]
+    assert [f["record"] for f in diff["resolved"]] == ["fixed.example.com", "example.com"]
+    assert diff["resolved"][1]["record_type"] == "MX"
+
+
+def test_load_baseline():
+    import json as _json
+    import tempfile
+
+    with tempfile.TemporaryDirectory() as d:
+        # First scheduled run: no previous report yet.
+        assert findmytakeover._load_baseline(os.path.join(d, "missing.json")) == []
+
+        good = os.path.join(d, "good.json")
+        with open(good, "w") as fh:
+            _json.dump({"findings": [_finding("a.example.com", "t.example")]}, fh)
+        assert len(findmytakeover._load_baseline(good)) == 1
+
+        # A corrupt baseline must not silently re-alert on everything.
+        for content in ("{not json", '{"summary": {}}'):
+            bad = os.path.join(d, "bad.json")
+            with open(bad, "w") as fh:
+                fh.write(content)
+            try:
+                findmytakeover._load_baseline(bad)
+            except SystemExit as e:
+                assert e.code == 1
+            else:
+                raise AssertionError(f"bad baseline accepted: {content}")
+
+
+def test_exit_codes():
+    from types import SimpleNamespace
+
+    def code(fail_findings, fail_incomplete, findings, incomplete):
+        args = SimpleNamespace(fail_on_findings=fail_findings, fail_on_incomplete=fail_incomplete)
+        return findmytakeover._exit_code(args, findings, incomplete)
+
+    assert code(False, False, 5, True) == 0   # both opt-in
+    assert code(True, False, 5, True) == 1
+    assert code(True, False, 0, True) == 0
+    assert code(False, True, 0, True) == 2
+    assert code(True, True, 3, True) == 1    # findings outrank an incomplete scan
+    assert code(True, True, 0, False) == 0
+
+
+def test_json_report_with_baseline_diff():
+    import json as _json
+    import tempfile
+
+    new = _finding("b.example.com", "x.netlify.app")
+    new["new"] = True
+    diff = {"new": [new], "resolved": [_finding("fixed.example.com", "old.herokuapp.com")]}
+    with tempfile.TemporaryDirectory() as d:
+        path = os.path.join(d, "report.json")
+        findmytakeover._write_json_report(path, [new], 0, (), diff)
+        with open(path) as fh:
+            report = _json.load(fh)
+    assert report["summary"]["new"] == 1
+    assert report["summary"]["resolved"] == 1
+    assert report["resolved"][0]["record"] == "fixed.example.com"
+    assert report["findings"][0]["new"] is True

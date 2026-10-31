@@ -565,9 +565,29 @@ def main():
             "requests to your subdomains."
         ),
     )
+    parser.add_argument(
+        "--baseline",
+        metavar="JSON_FILE",
+        help=(
+            "A previous --json report. Findings are marked new or already known, "
+            "fixed ones are listed as resolved, and --fail-on-findings only fails "
+            "on new findings. A missing file counts as an empty baseline (first run)."
+        ),
+    )
+    parser.add_argument(
+        "--fail-on-incomplete",
+        action="store_true",
+        help=(
+            "Exit with status 2 when part of the scan couldn't be collected (a "
+            "denied API, an unreachable account), unless status 1 already applies."
+        ),
+    )
     parser.add_argument("--version", action="version", version=f"findmytakeover {_version()}")
 
     args = parser.parse_args()
+
+    # Read the baseline before spending minutes scanning, so a bad path fails fast.
+    baseline = _load_baseline(args.baseline) if args.baseline else None
 
     click.echo(f"Reading the config from file - {args.config_file}")
     dns_config, infra_config, exclusions = read_config(args.config_file)
@@ -799,13 +819,76 @@ def main():
             suffix = f" (x{count})" if count > 1 else ""
             click.echo(f"  {provider} {what}: {error}{suffix}")
 
-    if args.json_file:
-        _write_json_report(args.json_file, findings, hidden_internal, COLLECTION_ERRORS)
+    diff = None
+    if baseline is not None:
+        diff = _compare_with_baseline(findings, baseline)
+        click.echo(
+            f"\n=== Compared with baseline {args.baseline}: "
+            f"{len(diff['new'])} new, {len(diff['resolved'])} resolved ==="
+        )
+        for label, items in (("New", diff["new"]), ("Resolved", diff["resolved"])):
+            for f in items:
+                click.echo(f"  {label}: {f['record']} -> {f['target']} [{f['target_owner']}, {f['confidence']}]")
+        if COLLECTION_ERRORS and diff["resolved"]:
+            click.echo("  (this scan is incomplete, so some 'resolved' findings may just be unscanned)")
 
-    # Opt-in so a scheduled scan or CI job can fail on findings instead of
-    # passing silently. Default stays 0 to keep existing callers working.
-    if args.fail_on_findings and dangling_count:
+    if args.json_file:
+        _write_json_report(args.json_file, findings, hidden_internal, COLLECTION_ERRORS, diff)
+
+    sys.exit(_exit_code(args, len(diff["new"]) if diff else len(findings), bool(COLLECTION_ERRORS)))
+
+
+def _exit_code(args, failing_findings, incomplete):
+    """0 = clean; 1 = findings (new ones, with --baseline) and --fail-on-findings;
+    2 = incomplete scan and --fail-on-incomplete. Both are opt-in so existing
+    callers keep exit status 0."""
+    if args.fail_on_findings and failing_findings:
+        return 1
+    if args.fail_on_incomplete and incomplete:
+        return 2
+    return 0
+
+
+def _finding_key(finding):
+    """What makes two runs' findings the same finding: the record, its type and
+    where it points. Confidence and DNS status may change between runs."""
+    return (
+        str(finding.get("record", "")).rstrip(".").lower(),
+        finding.get("record_type") or "",
+        str(finding.get("target", "")).rstrip(".").lower(),
+    )
+
+
+def _load_baseline(path):
+    """Findings from an earlier --json report. A missing file is an empty
+    baseline (the first scheduled run); an unreadable one is an error, because
+    silently treating it as empty would re-alert on everything."""
+    try:
+        with open(path) as handle:
+            report = json.load(handle)
+    except FileNotFoundError:
+        click.echo(f"Baseline {path} not found; treating every finding as new.")
+        return []
+    except (OSError, ValueError) as e:
+        click.echo(f"Could not read baseline {path}: {e}")
         sys.exit(1)
+    if not isinstance(report, dict) or not isinstance(report.get("findings"), list):
+        click.echo(f"Baseline {path} is not a findmytakeover --json report.")
+        sys.exit(1)
+    return report["findings"]
+
+
+def _compare_with_baseline(findings, baseline):
+    """Mark each finding new or known (sets finding["new"]) and return
+    {"new": [...], "resolved": [baseline findings no longer present]}."""
+    known = {_finding_key(f) for f in baseline}
+    current = {_finding_key(f) for f in findings}
+    for finding in findings:
+        finding["new"] = _finding_key(finding) not in known
+    return {
+        "new": [f for f in findings if f["new"]],
+        "resolved": [f for f in baseline if _finding_key(f) not in current],
+    }
 
 
 def _summarise_errors(errors):
@@ -817,7 +900,7 @@ def _summarise_errors(errors):
     return sorted(counts.items())
 
 
-def _write_json_report(path, findings, hidden_internal, collection_errors=()):
+def _write_json_report(path, findings, hidden_internal, collection_errors=(), diff=None):
     """Write findings as JSON to a path, or to stdout when path is '-'."""
     report = {
         "tool": "findmytakeover",
@@ -835,6 +918,10 @@ def _write_json_report(path, findings, hidden_internal, collection_errors=()):
         "collection_errors": list(collection_errors),
         "findings": findings,
     }
+    if diff is not None:
+        report["summary"]["new"] = len(diff["new"])
+        report["summary"]["resolved"] = len(diff["resolved"])
+        report["resolved"] = diff["resolved"]
 
     if path == "-":
         click.echo(json.dumps(report, indent=2))
