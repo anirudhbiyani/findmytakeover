@@ -3,7 +3,15 @@
 from cloudflare import Cloudflare, APIError
 import click
 
-from collector import is_cloud_nameserver, zone_key
+from collector import (
+    SECONDARY_RECORD_TYPES,
+    is_cloud_nameserver,
+    note_error,
+    secondary_targets,
+    zone_key,
+)
+
+_PROVIDER = "Cloudflare"
 
 _RELEVANT_RECORD_TYPES = frozenset(("A", "AAAA", "CNAME"))
 _USE_CLI_CREDS = "default"
@@ -54,6 +62,13 @@ class cloudflare:
                                 dnsdata.append([account, name, value])
                         elif record.type == "NS" and zone_key(name) != zone_key(zone.name):
                             ns_by_name.setdefault(name, []).append(content)
+                        elif record.type in SECONDARY_RECORD_TYPES:
+                            # MX content is the bare exchange (priority is a
+                            # separate field); SRV is "weight port target".
+                            dnsdata.extend(
+                                [account, name, target, record.type]
+                                for target in secondary_targets(record.type, content)
+                            )
 
                     # Child NS delegation to a cloud NS pool → dangling if the
                     # delegated zone is not in the inventory (see infra()).
@@ -61,7 +76,7 @@ class cloudflare:
                         if any(is_cloud_nameserver(ns) for ns in nameservers):
                             dnsdata.append([account, name, zone_key(name)])
             except APIError as e:
-                click.echo(f"Skipping Cloudflare account {account} - API error: {e}")
+                note_error(_PROVIDER, account, "DNS records", e)
 
         return dnsdata
 
@@ -81,7 +96,7 @@ class cloudflare:
             try:
                 zones = list(client.zones.list(account={"id": account}))
             except APIError as e:
-                click.echo(f"Skipping Cloudflare account {account} - API error listing zones: {e}")
+                note_error(_PROVIDER, account, "zones (all zone-level resources)", e)
                 continue
 
             for zone in zones:
@@ -95,7 +110,7 @@ class cloudflare:
                     for domain in (project.domains or []):
                         infradata.append([account, "pages", zone_key(str(domain))])
             except APIError as e:
-                click.echo(f"Skipping Cloudflare Pages for account {account} - API error: {e}")
+                note_error(_PROVIDER, account, "Cloudflare Pages", e)
 
             # Workers: workers.dev subdomain (per-script) + custom domains bound to a Worker.
             try:
@@ -115,7 +130,7 @@ class cloudflare:
                     if domain.hostname:
                         infradata.append([account, "workers", zone_key(domain.hostname)])
             except APIError as e:
-                click.echo(f"Skipping Cloudflare Workers for account {account} - API error: {e}")
+                note_error(_PROVIDER, account, "Cloudflare Workers", e)
 
             # R2 buckets: public r2.dev domain + any custom domains attached to the bucket.
             try:
@@ -142,7 +157,7 @@ class cloudflare:
                     except APIError:
                         pass  # no custom domains configured/permitted for this bucket
             except APIError as e:
-                click.echo(f"Skipping Cloudflare R2 for account {account} - API error: {e}")
+                note_error(_PROVIDER, account, "Cloudflare R2", e)
 
             # Tunnels: CNAME/target hostname is <tunnel-uuid>.cfargotunnel.com
             try:
@@ -151,7 +166,7 @@ class cloudflare:
                         hostname = f"{tunnel.id}.cfargotunnel.com"
                         infradata.append([account, "tunnel", zone_key(hostname)])
             except APIError as e:
-                click.echo(f"Skipping Cloudflare Tunnels for account {account} - API error: {e}")
+                note_error(_PROVIDER, account, "Cloudflare Tunnels", e)
 
             # Per-zone endpoint types: Custom Hostnames (Cloudflare for SaaS),
             # Load Balancers, and Spectrum applications.
@@ -161,14 +176,14 @@ class cloudflare:
                         if hostname.hostname:
                             infradata.append([account, "customhostname", zone_key(hostname.hostname)])
                 except APIError as e:
-                    click.echo(f"Skipping Custom Hostnames for zone {zone.name} - API error: {e}")
+                    note_error(_PROVIDER, zone.name, "Custom Hostnames", e)
 
                 try:
                     for lb in client.load_balancers.list(zone_id=zone.id):
                         if lb.name:
                             infradata.append([account, "loadbalancer", zone_key(lb.name)])
                 except APIError as e:
-                    click.echo(f"Skipping Load Balancers for zone {zone.name} - API error: {e}")
+                    note_error(_PROVIDER, zone.name, "Load Balancers", e)
 
                 try:
                     for app in client.spectrum.apps.list(zone_id=zone.id):
@@ -176,6 +191,6 @@ class cloudflare:
                         if dns is not None and dns.name:
                             infradata.append([account, "spectrum", zone_key(dns.name)])
                 except APIError as e:
-                    click.echo(f"Skipping Spectrum apps for zone {zone.name} - API error: {e}")
+                    note_error(_PROVIDER, zone.name, "Spectrum apps", e)
 
         return infradata

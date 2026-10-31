@@ -112,8 +112,16 @@ separately as "stale / out of scope," not as takeover risks:
 - **Email auth (DKIM/SPF etc.)** — CNAMEs into live SaaS provider zones
   (`*.dkim.*`, `*.domainkey.*`, `*.hubspotemail.net`, salesforce/highspot/etc.).
   Expected to have no infra in *your* accounts.
-- **MX / TXT / SOA / apex NS** — out of scope; never delete as part of this.
+- **SOA / apex NS** — out of scope; never delete as part of this.
   (Child NS *delegations* to a cloud NS pool are checked — see Pitfalls.)
+- **MX / SRV / SPF** — only reported when the target doesn't exist
+  (`confidence: target-nxdomain`). That means broken mail or SPF, and a
+  takeover only if the target's *domain* can be registered: check WHOIS before
+  calling it one. Never delete an apex MX without the user confirming where
+  mail should go instead.
+- **Incomplete scans.** If the run ends with "WARNING: the scan is incomplete"
+  (JSON `summary.complete: false`), some inventory or DNS wasn't read. Fix the
+  listed permissions and rerun before trusting any finding.
 - **Resources in an account you didn't scan.** If a value points at real infra
   living in an account/project/subscription that wasn't in the config, it shows
   up as dangling but isn't. Widen the scan before trusting the result — this is

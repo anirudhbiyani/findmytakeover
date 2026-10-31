@@ -6,7 +6,16 @@ from urllib.parse import urlparse
 import oci
 import click
 
-from collector import is_cloud_nameserver, zone_key, MAX_WORKERS
+from collector import (
+    MAX_WORKERS,
+    SECONDARY_RECORD_TYPES,
+    is_cloud_nameserver,
+    note_error,
+    secondary_targets,
+    zone_key,
+)
+
+_PROVIDER = "Oracle Cloud Infrastructure"
 
 _RELEVANT_RECORD_TYPES = frozenset(("A", "AAAA", "CNAME"))
 _USE_CLI_CREDS = "default"
@@ -74,7 +83,7 @@ def _try(label, fn):
     try:
         return fn()
     except oci.exceptions.ServiceError as e:
-        click.echo(f"Skipping {label} - {e.status} {e.code}")
+        note_error(_PROVIDER, "", label, f"{e.status} {e.code}")
         return []
 
 
@@ -144,7 +153,7 @@ def _function_rows(functions_client, compartment):
                 functions_client.list_functions, application_id=app.id
             ).data
         except oci.exceptions.ServiceError as e:
-            click.echo(f"Skipping functions in application {app.id} - {e.status} {e.code}")
+            note_error(_PROVIDER, app.id, "functions", f"{e.status} {e.code}")
             continue
 
         for fn in functions:
@@ -163,14 +172,14 @@ def _container_instance_rows(container_instance_client, network_client, compartm
         try:
             full = container_instance_client.get_container_instance(ci.id).data
         except oci.exceptions.ServiceError as e:
-            click.echo(f"Skipping container instance {ci.id} - {e.status} {e.code}")
+            note_error(_PROVIDER, ci.id, "container instance", f"{e.status} {e.code}")
             continue
 
         for vnic_ref in full.vnics or []:
             try:
                 vnic = network_client.get_vnic(vnic_ref.vnic_id).data
             except oci.exceptions.ServiceError as e:
-                click.echo(f"Skipping VNIC {vnic_ref.vnic_id} - {e.status} {e.code}")
+                note_error(_PROVIDER, vnic_ref.vnic_id, "VNIC", f"{e.status} {e.code}")
                 continue
             if vnic and vnic.public_ip:
                 rows.append([compartment, "containerinstance", vnic.public_ip])
@@ -312,7 +321,7 @@ class oracle:
                     dns_client.list_zones, compartment_id=compartment
                 ).data
             except oci.exceptions.ServiceError as e:
-                click.echo(f"Skipping compartment {compartment} - {e.status} {e.code}")
+                note_error(_PROVIDER, compartment, "DNS zones", f"{e.status} {e.code}")
                 continue
 
             for zone in zones:
@@ -328,6 +337,11 @@ class oracle:
                     elif rtype == "NS" and zone_key(name) != zone_key(zone.name):
                         if is_cloud_nameserver(record.rdata):
                             dnsdata.append([compartment, name, zone_key(name)])
+                    elif rtype in SECONDARY_RECORD_TYPES:
+                        dnsdata.extend(
+                            [compartment, name, target, rtype]
+                            for target in secondary_targets(rtype, record.rdata)
+                        )
 
         return dnsdata
 
@@ -343,7 +357,7 @@ class oracle:
         try:
             namespace = oci.object_storage.ObjectStorageClient(config).get_namespace().data
         except oci.exceptions.ServiceError as e:
-            click.echo(f"Skipping OCI object storage - {e.status} {e.code}")
+            note_error(_PROVIDER, "tenancy", "object storage", f"{e.status} {e.code}")
             namespace = None
 
         # Regions/compartments are independent and I/O-bound — collect them concurrently.
