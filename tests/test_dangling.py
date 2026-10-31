@@ -492,3 +492,16 @@ def test_aws_govcloud_partition():
     assert aws._partition("us-east-1") == "aws"
     assert not aws._offered_in("cloudfront", "us-gov-west-1")
     assert aws._offered_in("cloudfront", "us-east-1")
+
+
+def test_s3_hostname_regex_is_linear():
+    import time
+
+    from findmytakeover import _S3_HOSTNAME, _match_key
+
+    assert _match_key("b.s3-website.us-east-1.amazonaws.com") == "b"
+    assert _match_key("my-bucket.s3.amazonaws.com") == "my-bucket"
+    # CodeQL ReDoS reproducer: overlapping "-" handling made this exponential.
+    start = time.monotonic()
+    assert _S3_HOSTNAME.match("a.s3-" + "--" * 5000 + "!") is None
+    assert time.monotonic() - start < 1.0

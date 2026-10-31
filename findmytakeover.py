@@ -392,7 +392,9 @@ def _verify_dns_targets(hostnames):
 # bucket.s3-website-us-east-1.amazonaws.com, bucket.s3.dualstack.us-gov-west-1.amazonaws.com.
 # Bucket names may contain dots (website buckets are named after the site), so
 # the bucket is everything before the last ".s3" label.
-_S3_HOSTNAME = re.compile(r"^(?P<bucket>.+)\.s3(?:[.-][a-z0-9-]+)*\.amazonaws\.com$")
+# The endpoint labels are matched as [a-z0-9]+ runs split by "." or "-" so the
+# two can't both claim a "-": overlapping them backtracks exponentially.
+_S3_HOSTNAME = re.compile(r"^(?P<bucket>.+)\.s3(?:[.-][a-z0-9]+)*\.amazonaws\.com$")
 
 
 def _match_key(value):
