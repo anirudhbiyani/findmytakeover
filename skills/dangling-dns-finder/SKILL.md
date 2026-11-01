@@ -38,8 +38,11 @@ and interpret the JSON. The one exception is re-checking a single record with
 - **The tool.** Use whichever is available, in this order:
   - `findmytakeover --version` already works → use it.
   - Inside a checkout of the repo → `pip install .` (Python 3.12+).
-  - Otherwise → `pipx install findmytakeover`, or the Docker image (mount the
-    config and cloud credential directories read-only).
+  - Otherwise → the wheel from the latest GitHub release:
+    `gh release download --repo anirudhbiyani/findmytakeover --pattern '*.whl'`
+    then `pipx install ./findmytakeover-*.whl`. (`pipx install findmytakeover`
+    works too once the version is on PyPI.) Or the Docker image, with the
+    config and cloud credential directories mounted read-only.
   Below, `findmytakeover` means whichever of these you ended up with.
 - **Read-only credentials** already working in the local CLIs. The tool never
   logs in for the user:
@@ -93,12 +96,20 @@ findmytakeover -c findmytakeover.config --json findings.json
   provider's "no such site" page. It sends requests to the user's hosts, so
   **ask first**. It confirms takeovers DNS alone can't (most SaaS wildcard DNS).
 - `--no-verify-dns` makes no lookups at all, for offline or locked-down runs.
+- An NXDOMAIN only counts if public resolvers (1.1.1.1, 8.8.8.8) don't find
+  the name either, so a VPN's split-horizon DNS can't fake a `high` finding.
+  If outbound DNS is blocked, the system resolver's answer stands; set
+  `FINDMYTAKEOVER_CONFIRM_RESOLVERS` to resolvers the network allows.
+- The console prints how long each provider took. For a slow scan, raise
+  `FINDMYTAKEOVER_MAX_WORKERS` (default 8); if `collection_errors` mention
+  throttling or rate limits, lower it instead.
 
 ### 3. Check completeness first
 
 If `summary.complete` is `false` (console: "WARNING: the scan is incomplete"),
 some DNS or inventory was not read. `collection_errors` names the provider,
-scope and API that failed — usually a missing permission. A missing inventory
+scope and API that failed — usually a missing permission (an Azure
+`AuthorizationFailed` shows up here too). A missing inventory
 makes live records look dangling, so report the gaps **before** the findings
 and offer to fix and rerun.
 
@@ -142,7 +153,7 @@ Never delete an apex MX without asking where mail should go instead.
 - `--fail-on-incomplete` exits 2 when the scan had gaps. With both flags,
   failing findings take precedence (exit 1).
 - `--alert-webhook URL` (repeatable) or `FINDMYTAKEOVER_ALERT_WEBHOOKS`
-  (comma-separated) posts new findings at `--alert-confidence` levels. Slack
+  (space-separated) posts new findings at `--alert-confidence` levels. Slack
   URLs get Slack formatting, anything else gets JSON. Keep webhook URLs in
   secrets — never in the config or the repo.
 - `examples/github-actions-daily.yml` wires all of this into a daily GitHub
@@ -151,7 +162,8 @@ Never delete an apex MX without asking where mail should go instead.
   scratch.
 - Into security tooling: `--json-format ocsf` (SIEMs, Security Lake),
   `--json-format defectdojo`, or `--security-hub` (imports into the current
-  AWS account/region). Ids are stable, so daily re-imports update in place.
+  AWS account/region; needs `securityhub:BatchImportFindings`). Ids are
+  stable, so daily re-imports update in place.
   From Python, call `findmytakeover.scan()` instead of parsing the CLI.
 
 ### Before a Terraform apply
@@ -165,8 +177,9 @@ findmytakeover --terraform-plan plan.json   # exit 1 = a record would dangle
 ```
 
 It reports records (in the plan, plus live DNS if a config is present) that
-point at a resource the plan destroys. The fix is to delete or re-point those
-records in the same change.
+point at a resource the plan destroys. Without a config file it needs no cloud
+credentials, so it suits a pull-request check. The fix is to delete or
+re-point those records in the same change.
 
 ## Not a takeover risk
 
