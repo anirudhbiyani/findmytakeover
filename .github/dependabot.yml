@@ -1,11 +1,19 @@
-# To get started with Dependabot version updates, you'll need to specify which
-# package ecosystems to update and where the package manifests are located.
-# Please see the documentation for all configuration options:
+# Dependabot keeps requirements-lock.txt (the exact set the Docker image ships)
+# current. pyproject.toml holds ranges, so it only needs a change when a new
+# major release falls outside one.
+#
 # https://docs.github.com/code-security/dependabot/dependabot-version-updates/configuration-options-for-the-dependabot.yml-file
 
 version: 2
 updates:
-  - package-ecosystem: "pip" # See documentation for possible values
-    directory: "/" # Location of package manifests
+  - package-ecosystem: "pip"
+    directory: "/"
     schedule:
       interval: "weekly"
+    groups:
+      # Every minor and patch bump in one weekly PR instead of one PR per
+      # package. Major bumps still get their own PR: they can break APIs and
+      # need the pyproject.toml range widened.
+      lock-updates:
+        patterns: ["*"]
+        update-types: ["minor", "patch"]
