@@ -27,6 +27,20 @@ they summarise the shape of each release rather than listing every commit.
   cloud credentials, the previous run as baseline, a GitHub issue per new
   finding (closed when it's resolved), a standing "scan incomplete" issue, and
   optional webhook alerts.
+- **`--json-format ocsf|defectdojo`**: OCSF 1.3 Detection Findings for SIEMs
+  and Security Lake, or DefectDojo's generic findings import. Findings carry a
+  stable id, so re-imports update instead of duplicating.
+- **`--security-hub`** imports findings into AWS Security Hub (ASFF), archiving
+  resolved ones when `--baseline` is used.
+- **`--terraform-plan PLAN_JSON`** fails a plan that would leave a DNS record
+  pointing at a resource it destroys — records in the plan, plus live DNS when
+  a config is present.
+- **`findmytakeover.scan()`** as a library entry point, returning the same
+  findings as `--json`.
+
+### Changed
+
+- Console findings print record names without the trailing dot.
 
 ## [3.0.0] — 2026-10-31
 

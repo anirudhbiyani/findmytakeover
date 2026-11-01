@@ -49,11 +49,14 @@ Depending on the cloud provider, you would need permission read data. The follow
 ```
 # findmytakeover --help
 usage: findmytakeover [-h] [-c CONFIG_FILE] [-d DUMP_FILE]
-                      [--verify-dns | --no-verify-dns] [--json JSON_FILE]
-                      [--fail-on-findings] [--verify-http]
-                      [--baseline JSON_FILE] [--fail-on-incomplete]
-                      [--alert-webhook URL]
-                      [--alert-confidence ALERT_CONFIDENCE] [--version]
+                         [--verify-dns | --no-verify-dns] [--json JSON_FILE]
+                         [--fail-on-findings] [--verify-http]
+                         [--baseline JSON_FILE] [--fail-on-incomplete]
+                         [--alert-webhook URL]
+                         [--alert-confidence ALERT_CONFIDENCE]
+                         [--json-format {findmytakeover,ocsf,defectdojo}]
+                         [--security-hub] [--terraform-plan PLAN_JSON]
+                         [--version]
 
 Find dangling DNS records that may be vulnerable to subdomain takeover
 
@@ -98,6 +101,19 @@ options:
                         Comma-separated confidence levels that alert, or 'all'
                         (default: high,inventory-miss,target-nxdomain). With
                         --baseline only new findings alert.
+  --json-format {findmytakeover,ocsf,defectdojo}
+                        Format of the --json output: the native report
+                        (default), OCSF 1.3 Detection Findings for SIEMs and
+                        data lakes, or DefectDojo's generic findings import.
+  --security-hub        Import findings into AWS Security Hub in the current
+                        AWS session's account and region. With --baseline,
+                        resolved findings are archived.
+  --terraform-plan PLAN_JSON
+                        Instead of scanning, check a plan from 'terraform show
+                        -json': exit 1 if applying it would leave a DNS record
+                        (in the plan, or live via the config's DNS providers
+                        when the config exists) pointing at a resource it
+                        destroys.
   --version             show program's version number and exit
 ```
 
@@ -276,6 +292,61 @@ serving the provider's unclaimed page), `inventory-miss` (a cloud resource that
 no longer exists), `target-nxdomain` (a mail, SRV or SPF target that doesn't
 exist), `fingerprinted-still-resolving`, `fingerprinted-dns-unknown`,
 `fingerprinted-unverified`, or `unclassified-third-party`.
+
+### Security tools: OCSF, DefectDojo, Security Hub
+
+`--json-format` changes what `--json` writes:
+
+- `ocsf` — an array of [OCSF](https://schema.ocsf.io/) 1.3 Detection Findings
+  (class 2004), which Security Lake, Splunk, Sentinel, Datadog and most SIEMs
+  ingest. The original finding is kept under `unmapped`.
+- `defectdojo` — DefectDojo's *Generic Findings Import*, for vulnerability
+  management with owners and SLAs.
+
+`--security-hub` imports findings into AWS Security Hub (ASFF) in the current
+AWS session's account and region (`AWS_REGION`); it needs
+`securityhub:BatchImportFindings`. With `--baseline`, resolved findings are
+archived.
+
+Every format carries a stable finding id derived from the record, its type and
+its target, so re-importing a daily scan updates findings instead of
+duplicating them. Severity follows confidence: `high` → High;
+`inventory-miss`, `target-nxdomain` → Medium; `fingerprinted-*` → Low;
+`unclassified-third-party` → Info.
+
+### Checking a Terraform plan
+
+Most dangling records are created by deleting a resource and forgetting its DNS
+record. `--terraform-plan` catches that before `apply`:
+
+```
+terraform plan -out plan.tfplan
+terraform show -json plan.tfplan > plan.json
+findmytakeover --terraform-plan plan.json
+```
+
+It exits 1 when a DNS record would point at a resource the plan destroys:
+records in the plan itself (Route 53, Cloud DNS, Azure DNS, Cloudflare, OCI)
+and, when a config file is present, live records from its DNS providers.
+Records the plan deletes too, and resources it replaces at the same address,
+are not reported. No cloud credentials are needed without a config file, so it
+fits a pull-request check in Atlantis, Spacelift or GitHub Actions.
+
+### As a Python library
+
+```python
+import findmytakeover
+
+dns, infra, exclusions = findmytakeover.read_config("findmytakeover.config")
+result = findmytakeover.scan(dns, infra, exclusions, verify_dns=True)
+for finding in result["findings"]:
+    print(finding["record"], finding["confidence"])
+if result["collection_errors"]:
+    print("incomplete scan")
+```
+
+`scan()` returns the same findings as `--json`, plus `collection_errors` and
+`hidden_internal`.
 
 ## Configuration
 

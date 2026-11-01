@@ -667,3 +667,108 @@ def test_send_alerts_never_leaks_url_or_raises(capsys):
     assert "Alert sent to hooks.slack.com." in out
     assert "alert to down.example failed" in out and "alert to fail.example failed" in out
     assert "SECRET" not in out
+
+
+def _full_finding(record, target, confidence="high"):
+    return {**_finding(record, target, "CNAME", confidence), "dns_provider": "Amazon Web Services",
+            "account": "111122223333", "saas_service": "Heroku"}
+
+
+def test_scan_is_a_library_entry_point(monkeypatch):
+    class _Fake:
+        @staticmethod
+        def dns(accounts, cred):
+            return [["1", "old.example.com.", "dead.us-east-1.elb.amazonaws.com"],
+                    ["1", "live.example.com.", "live.us-east-1.elb.amazonaws.com"]]
+
+        @staticmethod
+        def infra(accounts, cred):
+            return [["1", "elb", "live.us-east-1.elb.amazonaws.com"]]
+
+    monkeypatch.setattr(findmytakeover, "_get_collector", lambda provider: _Fake)
+    providers = {"aws": {"enabled": True, "credentials": "default", "accounts": ["1"]}}
+    result = findmytakeover.scan(providers, providers, verify_dns=False)
+    assert [f["record"] for f in result["findings"]] == ["old.example.com"]
+    assert result["findings"][0]["confidence"] == "inventory-miss"
+    assert result["collection_errors"] == [] and result["hidden_internal"] == 0
+
+
+def test_export_formats():
+    f = _full_finding("a.example.com", "gone.herokuapp.com")
+    ocsf = findmytakeover._export("ocsf", [f])[0]
+    assert (ocsf["class_uid"], ocsf["type_uid"], ocsf["severity_id"]) == (2004, 200401, 4)
+    assert ocsf["resources"][0]["name"] == "a.example.com"
+    # Stable across runs and confidence changes, so re-imports update in place.
+    assert ocsf["finding_info"]["uid"] == findmytakeover._finding_uid({**f, "confidence": "inventory-miss"})
+
+    dojo = findmytakeover._export("defectdojo", [f])["findings"][0]
+    assert dojo["severity"] == "High" and dojo["component_name"] == "a.example.com"
+    assert dojo["unique_id_from_tool"] == ocsf["finding_info"]["uid"]
+
+
+def test_security_hub_import_batches_and_archives():
+    class _Client:
+        def __init__(self):
+            self.calls = []
+
+        def get_caller_identity(self):
+            return {"Account": "111122223333"}
+
+        def batch_import_findings(self, Findings):
+            self.calls.append(Findings)
+            return {"FailedCount": 0}
+
+    class _Session:
+        region_name = "us-gov-west-1"
+        client_obj = _Client()
+
+        def client(self, name, region_name):
+            return self.client_obj
+
+        def get_partition_for_region(self, region):
+            return "aws-us-gov"
+
+    session = _Session()
+    findings = [_full_finding(f"h{i}.example.com", "gone.herokuapp.com") for i in range(150)]
+    resolved = [_full_finding("fixed.example.com", "old.herokuapp.com")]
+    findmytakeover._send_to_security_hub(findings, resolved, session=session)
+    calls = session.client_obj.calls
+    assert [len(c) for c in calls] == [100, 51]
+    first, last = calls[0][0], calls[-1][-1]
+    assert first["ProductArn"] == "arn:aws-us-gov:securityhub:us-gov-west-1:111122223333:product/111122223333/default"
+    assert first["Severity"]["Label"] == "HIGH" and first["RecordState"] == "ACTIVE"
+    assert last["Resources"][0]["Id"] == "fixed.example.com" and last["RecordState"] == "ARCHIVED"
+
+
+def _rc(address, rtype, actions, before=None, after=None):
+    return {"address": address, "type": rtype,
+            "change": {"actions": actions, "before": before, "after": after}}
+
+
+def test_terraform_plan_guard():
+    lb = "web-123.us-east-1.elb.amazonaws.com"
+    plan = {"resource_changes": [
+        # The load balancer and bucket go; the replaced EIP keeps its address.
+        _rc("aws_lb.web", "aws_lb", ["delete"], before={"dns_name": lb, "name": "web"}),
+        _rc("aws_s3_bucket.site", "aws_s3_bucket", ["delete"], before={"bucket": "site.example.com"}),
+        _rc("aws_eip.nat", "aws_eip", ["delete", "create"],
+            before={"public_ip": "198.51.100.7"}, after={"public_ip": "198.51.100.7"}),
+        # A record the plan keeps, still pointing at the load balancer.
+        _rc("aws_route53_record.app", "aws_route53_record", ["no-op"],
+            before={}, after={"fqdn": "app.example.com", "type": "CNAME", "records": [lb]}),
+        # Deleted together with its target: fine.
+        _rc("aws_route53_record.old", "aws_route53_record", ["delete"],
+            before={"fqdn": "old.example.com", "type": "CNAME", "records": [lb]}),
+        _rc("aws_route53_record.nat", "aws_route53_record", ["no-op"],
+            before={}, after={"fqdn": "nat.example.com", "type": "A", "records": ["198.51.100.7"]}),
+    ]}
+    live = [
+        ["Amazon Web Services", "1", "site.example.com.", "site.example.com.s3-website-us-east-1.amazonaws.com", "CNAME"],
+        ["Amazon Web Services", "1", "old.example.com.", lb + ".", "CNAME"],  # deleted by the plan
+    ]
+    findings = findmytakeover._terraform_dangling(plan, live)
+    assert {(f["record"], f["destroyed_by"]) for f in findings} == {
+        ("app.example.com", "aws_lb.web"),
+        ("site.example.com", "aws_s3_bucket.site"),
+    }
+    assert findmytakeover._terraform_dangling({"resource_changes": []}) == []
