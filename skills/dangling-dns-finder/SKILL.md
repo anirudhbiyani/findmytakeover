@@ -181,6 +181,18 @@ point at a resource the plan destroys. Without a config file it needs no cloud
 credentials, so it suits a pull-request check. The fix is to delete or
 re-point those records in the same change.
 
+## Environment variables
+
+All optional; the tool runs with none set.
+
+| Variable | Default | What it does |
+|---|---|---|
+| `FINDMYTAKEOVER_MAX_WORKERS` | `8` | Threads per provider pool. Raise for slow scans; lower if errors mention throttling. |
+| `FINDMYTAKEOVER_CONFIRM_RESOLVERS` | `1.1.1.1,8.8.8.8` | Public resolvers that can overrule an NXDOMAIN (comma-separated). Empty string disables the check. |
+| `FINDMYTAKEOVER_ALERT_WEBHOOKS` | unset (no alerts) | Webhook URLs to alert, space-separated. Added to any `--alert-webhook`. |
+| `CLOUDFLARE_API_TOKEN` | unset | Cloudflare token used with `credentials: default`. |
+| `AWS_REGION` | unset | Region for `--security-hub` imports (or the profile's region). |
+
 ## Not a takeover risk
 
 Bucket these as "stale / out of scope", not takeover risks:
