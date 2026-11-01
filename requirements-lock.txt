@@ -37,7 +37,7 @@ azure-mgmt-appcontainers==5.1.0
     # via findmytakeover (pyproject.toml)
 azure-mgmt-cdn==14.1.0
     # via findmytakeover (pyproject.toml)
-azure-mgmt-compute==38.4.0
+azure-mgmt-compute==39.0.0
     # via findmytakeover (pyproject.toml)
 azure-mgmt-containerinstance==10.1.0
     # via findmytakeover (pyproject.toml)
