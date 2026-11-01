@@ -21,11 +21,16 @@ def _is_default_credentials(cred):
     return isinstance(cred, str) and cred.strip().lower() == _USE_CLI_CREDS
 
 
+# The SDK retries twice by default; rate limits (429) on accounts with many
+# zones need more patience than that.
+_CLIENT_OPTIONS = {"max_retries": 6, "timeout": 60.0}
+
+
 def _client(cred):
     """Cloudflare client. 'default' reads CLOUDFLARE_API_TOKEN from the env; otherwise cred is the API token."""
     if _is_default_credentials(cred):
-        return Cloudflare()
-    return Cloudflare(api_token=cred)
+        return Cloudflare(**_CLIENT_OPTIONS)
+    return Cloudflare(api_token=cred, **_CLIENT_OPTIONS)
 
 
 def _resolve_accounts(accounts, client, use_default):

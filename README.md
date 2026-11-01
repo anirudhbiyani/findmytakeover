@@ -372,9 +372,24 @@ discovered automatically. Supply `accounts` to narrow the scan.
 
 ### Tuning
 
-Collection is parallelised across accounts, regions, projects and compartments.
-Set `FINDMYTAKEOVER_MAX_WORKERS` (default `8`) to lower concurrency if you hit
-API rate limits.
+Providers, and their DNS and inventory sides, are collected at the same time.
+Within a provider, every account, region (or subscription) and service is its
+own task, run on a pool of `FINDMYTAKEOVER_MAX_WORKERS` threads (default `8`).
+AWS calls back off adaptively when throttled, so raising the worker count
+mostly costs retries rather than errors; lower it if collection errors mention
+rate limits. The console prints how long each provider took.
+
+API calls have connect/read timeouts and bounded retries, so a stalled
+connection fails over instead of hanging. Assumed AWS roles refresh their
+credentials, so scans longer than the role session (an hour by default) don't
+fail halfway through.
+
+An NXDOMAIN from the system resolver is checked against public resolvers
+(`1.1.1.1`, `8.8.8.8`) before it becomes a finding: split-horizon DNS on a VPN
+or corporate network can answer NXDOMAIN for a name that exists on the
+internet. Set `FINDMYTAKEOVER_CONFIRM_RESOLVERS` to other resolvers
+(comma-separated), or to an empty string to rely on the system resolver alone.
+Public resolvers that can't be reached don't block a finding.
 
 ### Exclusions
 

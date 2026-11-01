@@ -10,12 +10,15 @@ WORKDIR /src
 
 # Copy only what the package build needs (explicit, so local scan output /
 # credentials / config can never enter the image).
-COPY pyproject.toml README.md LICENSE ./
+COPY pyproject.toml README.md LICENSE requirements-lock.txt ./
 COPY findmytakeover.py ./
 COPY collector ./collector
 
-# Install the app and all dependencies into one self-contained directory.
-RUN pip install --no-cache-dir --target=/packages .
+# Install the locked dependency set, then the app itself, into one
+# self-contained directory. The lock makes image builds reproducible; pip
+# users get the ranges in pyproject.toml instead.
+RUN pip install --no-cache-dir --target=/packages -r requirements-lock.txt \
+ && pip install --no-cache-dir --target=/packages --no-deps .
 
 # ---- runtime stage ------------------------------------------------------
 # Alpine keeps the image small; build tooling stays behind in the builder.

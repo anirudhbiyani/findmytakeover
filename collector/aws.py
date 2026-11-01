@@ -1,10 +1,14 @@
 #!/usr/bin/env python3
 
+import threading
 from concurrent.futures import ThreadPoolExecutor
 from functools import lru_cache
 
 import boto3
+import botocore.session
 import click
+from botocore.config import Config
+from botocore.credentials import RefreshableCredentials
 from botocore.exceptions import BotoCoreError, ClientError, EndpointConnectionError
 
 from collector import (
@@ -32,6 +36,15 @@ _GLOBALACCELERATOR_REGION = "us-west-2"
 # recorded (see collector.note_error) rather than aborting the scan, because a
 # missing service is a gap in inventory, not a reason to lose every other one.
 _COLLECTION_ERRORS = (ClientError, BotoCoreError, KeyError)
+
+# Adaptive retries back off on throttling instead of failing the call, which
+# matters with many regions and services in flight at once. The timeouts stop
+# a stalled connection from holding a worker for botocore's default minute.
+_CLIENT_CONFIG = Config(
+    retries={"mode": "adaptive", "max_attempts": 10},
+    connect_timeout=10,
+    read_timeout=60,
+)
 
 
 def _paginate(client, method, result_key, **kwargs):
@@ -67,54 +80,57 @@ class aws:
 
     @staticmethod
     def infra(accounts, iamrole):
-        """Collect infrastructure data from AWS accounts."""
-        infradata = []
+        """Collect infrastructure data from AWS accounts.
+
+        Every (account, region, service) is its own task in one pool, so a
+        slow service in one region doesn't hold up the rest.
+        """
         use_default = _is_default_credentials(iamrole)
-        accounts = _resolve_accounts(accounts, use_default)
+        accounts = [
+            a for a in _resolve_accounts(accounts, use_default)
+            if use_default or _valid_account(a)
+        ]
 
-        for aws_account in accounts:
-            account_str = str(aws_account)
-
-            if not use_default and len(account_str) != 12:
-                click.echo(
-                    f"Please check the AWS Account number {aws_account}. It does not seem to be valid."
-                )
-                continue
-
-            click.echo(
-                f"Getting Infrastructure details from AWS Account - {account_str}"
-            )
-
-            # Account-global services (Route53, S3, CloudFront) — collect once, not per region.
-            _collect_global_infra(aws_account, iamrole, infradata)
-
-            try:
-                ec2_client = _create_client("ec2", iamrole, aws_account)
-                regions = [
-                    r["RegionName"] for r in ec2_client.describe_regions()["Regions"]
-                ]
-            except _COLLECTION_ERRORS as e:
-                note_error(_PROVIDER, account_str, "region list (all regional resources)", e)
-                continue
-
-            # Regions are independent and I/O-bound — collect them concurrently.
-            with ThreadPoolExecutor(max_workers=MAX_WORKERS) as pool:
-                for region_rows in pool.map(
-                    lambda region: _collect_region_infra(aws_account, iamrole, region),
-                    regions,
-                ):
-                    infradata.extend(region_rows)
-
+        infradata = []
+        with ThreadPoolExecutor(max_workers=MAX_WORKERS) as pool:
+            regions = dict(zip(accounts, pool.map(lambda a: _regions(a, iamrole), accounts)))
+            tasks = [
+                (account, None, label, collect)
+                for account in accounts
+                for label, collect in _global_collectors(_home_region(iamrole, account))
+            ] + [
+                (account, region, label, collect)
+                for account in accounts
+                for region in regions[account]
+                for label, collect in _REGIONAL_COLLECTORS
+            ]
+            for rows in pool.map(lambda task: _run_collector(iamrole, *task), tasks):
+                infradata.extend(rows)
         return infradata
+
+
+def _valid_account(aws_account):
+    if len(str(aws_account)) == 12:
+        return True
+    click.echo(f"Please check the AWS Account number {aws_account}. It does not seem to be valid.")
+    return False
+
+
+def _regions(aws_account, iamrole):
+    """Regions enabled for the account; [] (and a recorded gap) if unlisted."""
+    click.echo(f"Getting Infrastructure details from AWS Account - {aws_account}")
+    try:
+        ec2 = _create_client("ec2", iamrole, aws_account)
+        return [r["RegionName"] for r in ec2.describe_regions()["Regions"]]
+    except _COLLECTION_ERRORS as e:
+        note_error(_PROVIDER, str(aws_account), "region list (all regional resources)", e)
+        return []
 
 
 def _dns_for_account(aws_account, iamrole, use_default):
     """Collect Route53 DNS records for a single account (returns rows)."""
     account_str = str(aws_account)
-    if not use_default and len(account_str) != 12:
-        click.echo(
-            f"Please check the AWS Account number {aws_account}. It does not seem to be valid."
-        )
+    if not use_default and not _valid_account(aws_account):
         return []
 
     click.echo(f"Reading DNS data from AWS Account - {account_str}")
@@ -217,79 +233,105 @@ def _offered_in(service, region):
 
 
 @lru_cache(maxsize=None)
-def _assume_role(aws_account, iamrole):
-    """Assume IAM role and return temporary credentials (cached per account for the run)."""
+def _role_credentials(aws_account, iamrole):
+    """Assumed-role credentials for the account, shared by every thread and
+    refreshed before they expire, so a scan longer than the role session
+    (an hour by default) doesn't start failing halfway through."""
     region = _home_region(iamrole, aws_account)
-    sts_client = boto3.client("sts", region_name=region)
-    assume_role_response = sts_client.assume_role(
-        RoleArn=f"arn:{_partition(region)}:iam::{aws_account}:role/{iamrole}",
-        RoleSessionName="findmytakeover",
+    sts = boto3.Session().client("sts", region_name=region, config=_CLIENT_CONFIG)
+    role_arn = f"arn:{_partition(region)}:iam::{aws_account}:role/{iamrole}"
+
+    def fetch():
+        credentials = sts.assume_role(RoleArn=role_arn, RoleSessionName="findmytakeover")["Credentials"]
+        return {
+            "access_key": credentials["AccessKeyId"],
+            "secret_key": credentials["SecretAccessKey"],
+            "token": credentials["SessionToken"],
+            "expiry_time": credentials["Expiration"].isoformat(),
+        }
+
+    return RefreshableCredentials.create_from_metadata(
+        metadata=fetch(), refresh_using=fetch, method="sts-assume-role"
     )
-    return assume_role_response["Credentials"]
+
+
+# boto3 sessions aren't thread-safe, so each thread gets its own per account.
+# Clients are thread-safe and slow to build, so they're shared and cached.
+_thread_local = threading.local()
+_CLIENTS = {}
+
+
+def _session(iamrole, aws_account):
+    sessions = _thread_local.__dict__.setdefault("sessions", {})
+    key = (iamrole, aws_account)
+    if key not in sessions:
+        if _is_default_credentials(iamrole):
+            sessions[key] = boto3.Session(profile_name=aws_account)
+        else:
+            core = botocore.session.get_session()
+            # botocore has no public setter for credentials on a session;
+            # this is the documented-by-usage way to inject refreshable ones.
+            core._credentials = _role_credentials(aws_account, iamrole)
+            sessions[key] = boto3.Session(botocore_session=core)
+    return sessions[key]
 
 
 def _create_client(service, iamrole, aws_account=None, region=None):
-    """Create a boto3 client, using a named CLI profile or assumed role."""
-    kwargs = {"region_name": region or _home_region(iamrole, aws_account)}
-
-    if _is_default_credentials(iamrole):
-        return boto3.Session(profile_name=aws_account).client(service, **kwargs)
-
-    credentials = _assume_role(aws_account, iamrole)
-    kwargs.update({
-        "aws_access_key_id": credentials["AccessKeyId"],
-        "aws_secret_access_key": credentials["SecretAccessKey"],
-        "aws_session_token": credentials["SessionToken"],
-    })
-    return boto3.client(service, **kwargs)
+    """A cached boto3 client, using a named CLI profile or an assumed role."""
+    region = region or _home_region(iamrole, aws_account)
+    key = (service, iamrole, aws_account, region)
+    client = _CLIENTS.get(key)
+    if client is None:
+        client = _session(iamrole, aws_account).client(
+            service, region_name=region, config=_CLIENT_CONFIG
+        )
+        client = _CLIENTS.setdefault(key, client)  # another thread may have won
+    return client
 
 
-def _collect_global_infra(aws_account, iamrole, infradata):
-    """Collect account-global resources (Route53 zones, S3, CloudFront) once per account."""
-    home = _home_region(iamrole, aws_account)
+# --- Account-global collectors (Route 53 zones, S3, CloudFront, Global
+# Accelerator): collected once per account, not per region. Same shape as the
+# regional collectors below.
 
-    def make(service, region=None):
-        return _create_client(service, iamrole, aws_account, region=region)
+def _hosted_zones(make):
+    # Hosted zone names — the "live zones" a delegated NS record is matched against.
+    for zone in _paginate(make("route53"), "list_hosted_zones", "HostedZones"):
+        yield zone_key(zone["Name"])
 
-    def hosted_zones():
-        # Hosted zone names — the "live zones" a delegated NS record is matched against.
-        for zone in _paginate(make("route53"), "list_hosted_zones", "HostedZones"):
-            yield zone_key(zone["Name"])
 
-    def s3_buckets():
-        # Bucket names; findmytakeover reduces S3 endpoint hostnames to these.
-        for bucket in make("s3").list_buckets()["Buckets"]:
-            yield bucket["Name"]
+def _s3_buckets(make):
+    # Bucket names; findmytakeover reduces S3 endpoint hostnames to these.
+    for bucket in make("s3").list_buckets()["Buckets"]:
+        yield bucket["Name"]
 
-    def cloudfront():
-        # DistributionList is a dict, not a list, so iterate pages directly.
-        for page in make("cloudfront").get_paginator("list_distributions").paginate():
-            for dist in page.get("DistributionList", {}).get("Items", []):
-                yield dist["DomainName"]
 
-    def globalaccelerator():
-        # Control plane only exists in us-west-2.
-        client = make("globalaccelerator", region=_GLOBALACCELERATOR_REGION)
-        for accelerator in _paginate(client, "list_accelerators", "Accelerators"):
-            yield accelerator.get("DnsName")
+def _cloudfront(make):
+    # DistributionList is a dict, not a list, so iterate pages directly.
+    for page in make("cloudfront").get_paginator("list_distributions").paginate():
+        for dist in page.get("DistributionList", {}).get("Items", []):
+            yield dist["DomainName"]
 
-    collectors = [("hostedzone", hosted_zones), ("s3", s3_buckets)]
-    if _offered_in("cloudfront", home):
-        collectors.append(("cloudfront", cloudfront))
-    if _offered_in("globalaccelerator", home):
-        collectors.append(("globalaccelerator", globalaccelerator))
 
-    for label, collect in collectors:
-        try:
-            infradata.extend(
-                [aws_account, label, _strip_url(value)] for value in collect() if value
-            )
-        except _COLLECTION_ERRORS as e:
-            note_error(_PROVIDER, aws_account, label, e)
+def _globalaccelerator(make):
+    # Control plane only exists in us-west-2.
+    client = make("globalaccelerator", _GLOBALACCELERATOR_REGION)
+    for accelerator in _paginate(client, "list_accelerators", "Accelerators"):
+        yield accelerator.get("DnsName")
+
+
+def _global_collectors(home_region):
+    """Global collectors for the partition: CloudFront and Global Accelerator
+    don't exist in GovCloud."""
+    collectors = [("hostedzone", _hosted_zones), ("s3", _s3_buckets)]
+    if _offered_in("cloudfront", home_region):
+        collectors.append(("cloudfront", _cloudfront))
+    if _offered_in("globalaccelerator", home_region):
+        collectors.append(("globalaccelerator", _globalaccelerator))
+    return collectors
 
 
 # --- Regional collectors. Each takes a client factory and yields endpoint
-# values (hostnames or IPs); _collect_region_infra runs each in isolation so a
+# values (hostnames or IPs); _run_collector runs each in isolation so a
 # denied or unavailable service only costs its own rows.
 
 def _public_ips(make):
@@ -432,21 +474,21 @@ _REGIONAL_COLLECTORS = (
 )
 
 
-def _collect_region_infra(aws_account, iamrole, region):
-    """Collect infrastructure data from a specific region (returns rows)."""
+def _run_collector(iamrole, aws_account, region, label, collect):
+    """Run one collector for one account (and region; None for global ones)
+    in isolation: a denied or unavailable service only costs its own rows."""
+    def make(service, service_region=None):
+        return _create_client(service, iamrole, aws_account, service_region or region)
 
-    def make(service):
-        return _create_client(service, iamrole, aws_account, region)
-
-    infradata = []
-    for label, collect in _REGIONAL_COLLECTORS:
-        try:
-            infradata.extend(
-                [aws_account, label, _strip_url(value)] for value in collect(make) if value
-            )
-        except EndpointConnectionError:
-            # The service isn't offered in this region — nothing to collect.
-            pass
-        except _COLLECTION_ERRORS as e:
-            note_error(_PROVIDER, f"{aws_account}/{region}", label, e)
-    return infradata
+    try:
+        return [[aws_account, label, _strip_url(value)] for value in collect(make) if value]
+    except EndpointConnectionError:
+        # The service isn't offered in this region — nothing to collect.
+        return []
+    except Exception as e:
+        # Anything else — a denied API, or an unexpected response shape —
+        # is a gap in this one service. Raising would cost every other task
+        # in the pool its results.
+        scope = f"{aws_account}/{region}" if region else str(aws_account)
+        note_error(_PROVIDER, scope, label, e)
+        return []
