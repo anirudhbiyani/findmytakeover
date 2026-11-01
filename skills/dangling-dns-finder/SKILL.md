@@ -149,6 +149,24 @@ Never delete an apex MX without asking where mail should go instead.
   Actions job with OIDC cloud auth, the previous report as baseline, and one
   GitHub issue per finding. Copy it rather than writing a workflow from
   scratch.
+- Into security tooling: `--json-format ocsf` (SIEMs, Security Lake),
+  `--json-format defectdojo`, or `--security-hub` (imports into the current
+  AWS account/region). Ids are stable, so daily re-imports update in place.
+  From Python, call `findmytakeover.scan()` instead of parsing the CLI.
+
+### Before a Terraform apply
+
+When the user is about to destroy infrastructure, or asks to stop dangling
+records from being created, check the plan instead of scanning:
+
+```bash
+terraform show -json plan.tfplan > plan.json
+findmytakeover --terraform-plan plan.json   # exit 1 = a record would dangle
+```
+
+It reports records (in the plan, plus live DNS if a config is present) that
+point at a resource the plan destroys. The fix is to delete or re-point those
+records in the same change.
 
 ## Not a takeover risk
 

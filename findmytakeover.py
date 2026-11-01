@@ -1,12 +1,14 @@
 #!/usr/bin/env python3
 
 import argparse
+import hashlib
 import ipaddress
 import json
 import os
 import re
 import sys
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import datetime, timezone
 from urllib.parse import urlparse
 
 import click
@@ -509,6 +511,210 @@ def _version():
         return "unknown"
 
 
+def scan(dns_config, infra_config, exclusions=None, verify_dns=True, verify_http=False, dump_file=None):
+    """Collect DNS and inventory, diff them and classify every dangling record.
+
+    The library entry point: takes the output of read_config() and returns
+    {"findings": [...], "hidden_internal": int, "collection_errors": [...]},
+    the same findings the --json report carries. Progress still goes to the
+    console.
+    """
+    COLLECTION_ERRORS.clear()  # errors belong to this scan, not an earlier one
+    records_df = pd.DataFrame(
+        _collect_dns_records(dns_config), columns=["csp", "account", "dnskey", "dnsvalue", "rtype"]
+    )
+    infrastructure_df = pd.DataFrame(
+        _collect_infrastructure(infra_config), columns=["csp", "account", "service", "value"]
+    )
+
+    if dump_file:
+        click.echo(f"Dumping data to file - {dump_file}")
+        # Overwrite: appending mixed every earlier run's inventory into this one.
+        infrastructure_df.to_csv(dump_file, mode="w", index=False)
+        with open(dump_file, "a") as f:
+            f.write("-" * 100 + "\n")
+        records_df.to_csv(dump_file, mode="a", index=False)
+
+    click.echo("Checking for possible dangling DNS records!")
+    result = _find_dangling_records(records_df, infrastructure_df, exclusions or _Exclusions())
+
+    findings = []
+    external = []  # third-party targets, tiered by SaaS fingerprinting below
+    secondary = []  # third-party MX/SRV/SPF targets, reported only if NXDOMAIN
+    hidden_internal = 0
+    for idx in result.index:
+        if result.loc[idx, "value"] != "":
+            continue
+
+        name = result.loc[idx, "dnskey"]
+        value = result.loc[idx, "dnsvalue"]
+        rtype = result.loc[idx, "rtype"]
+        if _is_internal_record(name, value):
+            hidden_internal += 1
+            continue
+
+        label = _classify_target(value)
+        finding = {
+            "record": str(name).rstrip("."),
+            "record_type": rtype or None,
+            "target": str(value).rstrip("."),
+            "dns_provider": str(result.loc[idx, "csp_x"]),
+            "account": str(result.loc[idx, "account_x"]),
+            "target_owner": label,
+            "saas_service": identify_service(value) if label == "External" else None,
+            "dns_status": None,
+            "http_status": None,
+            "confidence": "inventory-miss",
+        }
+
+        # Almost every zone has an MX at a mail provider and an SPF include of
+        # one; those are never in inventory. Only a target that no longer exists
+        # is a finding, so hold them back until DNS has been checked.
+        if rtype in SECONDARY_RECORD_TYPES and label == "External":
+            secondary.append(finding)
+            continue
+
+        findings.append(finding)
+        if label == "External":
+            external.append(finding)
+
+    # SaaS takeover fingerprinting + passive DNS confirmation, scoped to
+    # third-party targets. Only fingerprinted hostnames (and MX/SRV/SPF
+    # targets) are resolved, and NXDOMAIN is the only DNS signal treated as a
+    # finding.
+    dns_status = {}
+    hostnames_to_check = {f["target"] for f in external if f["saas_service"]}
+    hostnames_to_check |= {f["target"] for f in secondary}
+    if hostnames_to_check:
+        if not verify_dns:
+            click.echo("\nDNS verification disabled (--no-verify-dns); skipping NXDOMAIN checks on SaaS, mail and SPF targets.")
+        elif not _DNSPYTHON_AVAILABLE:
+            click.echo(
+                "\nDNS verification requested but the 'dnspython' package isn't installed "
+                "(pip install dnspython); skipping NXDOMAIN checks on SaaS, mail and SPF targets."
+            )
+        else:
+            click.echo(f"\nResolving {len(hostnames_to_check)} third-party hostname(s) to check for NXDOMAIN...")
+            dns_status = _verify_dns_targets(hostnames_to_check)
+
+    # MX/SRV/SPF targets: a third-party target that doesn't exist means mail
+    # or SPF is pointed at a name someone may be able to register.
+    for finding in secondary:
+        if dns_status.get(finding["target"].lower()) == "nxdomain":
+            finding["dns_status"] = "nxdomain"
+            finding["confidence"] = "target-nxdomain"
+            findings.append(finding)
+
+    # Opt-in HTTP confirmation for fingerprinted targets DNS couldn't settle:
+    # most SaaS providers wildcard their DNS, but serve a recognisable
+    # "no such site" page for a hostname nobody has claimed.
+    http_status = {}
+    if verify_http:
+        to_fetch = {
+            f["record"]: http_fingerprint(f["saas_service"])
+            for f in external
+            if f["saas_service"]
+            and http_fingerprint(f["saas_service"])
+            and dns_status.get(f["target"].lower()) != "nxdomain"
+        }
+        if to_fetch:
+            click.echo(f"Fetching {len(to_fetch)} subdomain(s) over HTTP to match takeover fingerprints...")
+            http_status = _verify_http_targets(to_fetch)
+
+    for finding in external:
+        if not finding["saas_service"]:
+            finding["confidence"] = "unclassified-third-party"
+            continue
+        status = dns_status.get(finding["target"].lower())
+        finding["dns_status"] = status
+        finding["http_status"] = http_status.get(finding["record"])
+        if status == "nxdomain" or finding["http_status"] == "matched":
+            finding["confidence"] = "high"
+        elif status == "resolves":
+            finding["confidence"] = "fingerprinted-still-resolving"
+        elif status == "unknown":
+            finding["confidence"] = "fingerprinted-dns-unknown"
+        else:
+            finding["confidence"] = "fingerprinted-unverified"
+
+    return {
+        "findings": findings,
+        "hidden_internal": hidden_internal,
+        "collection_errors": list(COLLECTION_ERRORS),
+    }
+
+
+# Console notes for the third-party tiers, keyed by confidence.
+_EXTERNAL_TIERS = (
+    ("HIGH CONFIDENCE: fingerprinted SaaS target is unclaimed", ("high",)),
+    ("Fingerprinted SaaS target, not confirmed dangling", (
+        "fingerprinted-still-resolving", "fingerprinted-dns-unknown", "fingerprinted-unverified",
+    )),
+    ("Unclassified third-party target", ("unclassified-third-party",)),
+)
+_TIER_NOTES = {
+    "fingerprinted-still-resolving": "still resolving",
+    "fingerprinted-dns-unknown": "DNS status unknown",
+    "fingerprinted-unverified": "DNS check skipped",
+}
+
+
+def _finding_line(f):
+    kind = f.get("record_type") or ""
+    type_tag = f"{'SPF include' if kind == 'TXT' else kind} " if kind else ""
+    line = (
+        f"  {f['record']} -> {type_tag}{f['target']} "
+        f"[{f['dns_provider']} zone, account/subscription/project: {f['account']}]"
+    )
+    service = f.get("saas_service")
+    if f["confidence"] == "high":
+        why = "NXDOMAIN" if f.get("dns_status") == "nxdomain" else "unclaimed-site page served"
+        line += f"  [{service} — {why}, likely claimable]"
+    elif f["confidence"] in _TIER_NOTES:
+        line += f"  [{service} — {_TIER_NOTES[f['confidence']]}]"
+    elif f["confidence"] == "target-nxdomain":
+        line += "  [target does not exist — check whether its domain can be registered]"
+    return line
+
+
+def _print_findings(findings, hidden_internal):
+    """Console report: cloud-owned targets by provider, then third-party tiers,
+    then mail/SRV/SPF targets that don't exist."""
+    if not findings:
+        click.echo("No dangling DNS records found!")
+    else:
+        for label in _TARGET_ORDER:
+            entries = [f for f in findings if f["target_owner"] == label and f["confidence"] == "inventory-miss"]
+            if entries:
+                click.echo(f"\n=== Targets on {label} ({len(entries)}) ===")
+                for f in entries:
+                    click.echo(_finding_line(f))
+
+        external = [f for f in findings if f["target_owner"] == "External" and f["confidence"] != "target-nxdomain"]
+        if external:
+            click.echo(f"\n=== Targets on External / third-party (SaaS, bare IPs) ({len(external)}) ===")
+            for title, levels in _EXTERNAL_TIERS:
+                tier = [f for f in external if f["confidence"] in levels]
+                if tier:
+                    click.echo(f"\n  --- {title} ({len(tier)}) ---")
+                    for f in tier:
+                        click.echo(_finding_line(f))
+
+        missing = [f for f in findings if f["confidence"] == "target-nxdomain"]
+        if missing:
+            click.echo(f"\n=== Mail, SRV and SPF targets that do not exist (NXDOMAIN) ({len(missing)}) ===")
+            for f in missing:
+                click.echo(_finding_line(f))
+
+        click.echo(f"\nTotal dangling DNS records found: {len(findings)}")
+
+    if hidden_internal:
+        click.echo(
+            f"\n({hidden_internal} record(s) pointing at private/internal addresses "
+            "hidden — not takeover risks; use the dump file to see them)"
+        )
+
+
 def main():
     click.secho(CLI_PROMPT, bold=True, fg="green")
 
@@ -604,6 +810,34 @@ def main():
             "only new findings alert."
         ),
     )
+    parser.add_argument(
+        "--json-format",
+        choices=("findmytakeover", "ocsf", "defectdojo"),
+        default="findmytakeover",
+        help=(
+            "Format of the --json output: the native report (default), OCSF 1.3 "
+            "Detection Findings for SIEMs and data lakes, or DefectDojo's generic "
+            "findings import."
+        ),
+    )
+    parser.add_argument(
+        "--security-hub",
+        action="store_true",
+        help=(
+            "Import findings into AWS Security Hub in the current AWS session's "
+            "account and region. With --baseline, resolved findings are archived."
+        ),
+    )
+    parser.add_argument(
+        "--terraform-plan",
+        metavar="PLAN_JSON",
+        help=(
+            "Instead of scanning, check a plan from 'terraform show -json': exit 1 "
+            "if applying it would leave a DNS record (in the plan, or live via the "
+            "config's DNS providers when the config exists) pointing at a resource "
+            "it destroys."
+        ),
+    )
     parser.add_argument("--version", action="version", version=f"findmytakeover {_version()}")
 
     args = parser.parse_args()
@@ -612,226 +846,17 @@ def main():
     # Read the baseline before spending minutes scanning, so a bad path fails fast.
     baseline = _load_baseline(args.baseline) if args.baseline else None
 
+    if args.terraform_plan:
+        sys.exit(_terraform_guard(args))
+
     click.echo(f"Reading the config from file - {args.config_file}")
     dns_config, infra_config, exclusions = read_config(args.config_file)
-
-    # Collect data
-    record_list = _collect_dns_records(dns_config)
-    infrastructure_list = _collect_infrastructure(infra_config)
-
-    # Create DataFrames
-    records_df = pd.DataFrame(
-        record_list, columns=["csp", "account", "dnskey", "dnsvalue", "rtype"]
+    result = scan(
+        dns_config, infra_config, exclusions,
+        verify_dns=args.verify_dns, verify_http=args.verify_http, dump_file=args.dump_file,
     )
-    infrastructure_df = pd.DataFrame(
-        infrastructure_list, columns=["csp", "account", "service", "value"]
-    )
-
-    # Dump data if requested
-    if args.dump_file:
-        click.echo(f"Dumping data to file - {args.dump_file}")
-        # Overwrite: appending mixed every earlier run's inventory into this one.
-        infrastructure_df.to_csv(args.dump_file, mode="w", index=False)
-        with open(args.dump_file, "a") as f:
-            f.write("-" * 100 + "\n")
-        records_df.to_csv(args.dump_file, mode="a", index=False)
-
-    # Find dangling records
-    if not dns_config or not infra_config:
-        click.echo(
-            "To check for dangling domains, both DNS and Infrastructure providers need to be configured."
-        )
-        return
-
-    click.echo("Checking for possible dangling DNS records!")
-
-    result = _find_dangling_records(records_df, infrastructure_df, exclusions)
-
-    # Group dangling records by the provider that owns the target resource,
-    # hiding internal/private ones (not takeover risks). External (third-party)
-    # targets are set aside for SaaS fingerprinting below.
-    grouped = {label: [] for label in _TARGET_ORDER if label != "External"}
-    external_entries = []
-    secondary_entries = []  # third-party MX/SRV/SPF targets, reported only if NXDOMAIN
-    findings = []
-    hidden_internal = 0
-    for idx in result.index:
-        if result.loc[idx, "value"] != "":
-            continue
-
-        name = result.loc[idx, "dnskey"]
-        value = result.loc[idx, "dnsvalue"]
-        rtype = result.loc[idx, "rtype"]
-        if _is_internal_record(name, value):
-            hidden_internal += 1
-            continue
-
-        type_tag = f"{'SPF include' if rtype == 'TXT' else rtype} " if rtype else ""
-        line = (
-            f"  {name} -> {type_tag}{value} "
-            f"[{result.loc[idx, 'csp_x']} zone, account/subscription/project: {result.loc[idx, 'account_x']}]"
-        )
-        label = _classify_target(value)
-
-        # One structured record per finding, shared with the JSON output. The
-        # External tiering below mutates these same dicts, so console and JSON
-        # can never disagree.
-        finding = {
-            "record": str(name).rstrip("."),
-            "record_type": rtype or None,
-            "target": str(value).rstrip("."),
-            "dns_provider": str(result.loc[idx, "csp_x"]),
-            "account": str(result.loc[idx, "account_x"]),
-            "target_owner": label,
-            "saas_service": None,
-            "dns_status": None,
-            "http_status": None,
-            "confidence": "inventory-miss",
-        }
-
-        # Almost every zone has an MX at a mail provider and an SPF include of
-        # one; those are never in inventory. Only a target that no longer exists
-        # is a finding, so hold them back until DNS has been checked.
-        if rtype in SECONDARY_RECORD_TYPES and label == "External":
-            finding["saas_service"] = identify_service(value)
-            secondary_entries.append({"value": value, "line": line, "finding": finding})
-            continue
-
-        findings.append(finding)
-
-        if label == "External":
-            finding["saas_service"] = identify_service(value)
-            external_entries.append({"value": value, "line": line, "finding": finding})
-        else:
-            grouped[label].append(line)
-
-    # SaaS takeover fingerprinting + passive DNS confirmation, scoped to the
-    # External bucket. Only fingerprinted hostnames (and third-party MX/SRV/SPF
-    # targets) are resolved, and NXDOMAIN is the only DNS signal treated as a
-    # finding.
-    dns_status = {}
-    hostnames_to_check = {e["value"] for e in external_entries if e["finding"]["saas_service"]}
-    hostnames_to_check |= {e["value"] for e in secondary_entries}
-    if hostnames_to_check:
-        if not args.verify_dns:
-            click.echo("\nDNS verification disabled (--no-verify-dns); skipping NXDOMAIN checks on SaaS, mail and SPF targets.")
-        elif not _DNSPYTHON_AVAILABLE:
-            click.echo(
-                "\nDNS verification requested but the 'dnspython' package isn't installed "
-                "(pip install dnspython); skipping NXDOMAIN checks on SaaS, mail and SPF targets."
-            )
-        else:
-            click.echo(f"\nResolving {len(hostnames_to_check)} third-party hostname(s) to check for NXDOMAIN...")
-            dns_status = _verify_dns_targets(hostnames_to_check)
-
-    # MX/SRV/SPF targets: a third-party target that doesn't exist means mail
-    # or SPF is pointed at a name someone may be able to register.
-    missing_secondary = []
-    for entry in secondary_entries:
-        finding = entry["finding"]
-        status = dns_status.get(str(entry["value"]).rstrip(".").lower())
-        if status != "nxdomain":
-            continue
-        finding["dns_status"] = status
-        finding["confidence"] = "target-nxdomain"
-        findings.append(finding)
-        missing_secondary.append(f"{entry['line']}  [target does not exist — check whether its domain can be registered]")
-
-    # Opt-in HTTP confirmation for fingerprinted targets DNS couldn't settle:
-    # most SaaS providers wildcard their DNS, but serve a recognisable
-    # "no such site" page for a hostname nobody has claimed.
-    http_status = {}
-    if args.verify_http:
-        to_fetch = {
-            e["finding"]["record"]: http_fingerprint(e["finding"]["saas_service"])
-            for e in external_entries
-            if e["finding"]["saas_service"]
-            and http_fingerprint(e["finding"]["saas_service"])
-            and dns_status.get(str(e["value"]).rstrip(".").lower()) != "nxdomain"
-        }
-        if to_fetch:
-            click.echo(f"Fetching {len(to_fetch)} subdomain(s) over HTTP to match takeover fingerprints...")
-            http_status = _verify_http_targets(to_fetch)
-
-    takeover_candidates = []  # (a) fingerprinted + confirmed NXDOMAIN
-    fingerprinted_unconfirmed = []  # (b) fingerprinted, still resolving or DNS status unknown
-    unclassified_external = []  # (c) no known SaaS fingerprint
-    for entry in external_entries:
-        finding = entry["finding"]
-        service = finding["saas_service"]
-        if not service:
-            unclassified_external.append(entry["line"])
-            finding["confidence"] = "unclassified-third-party"
-            continue
-
-        status = dns_status.get(str(entry["value"]).rstrip(".").lower())
-        finding["dns_status"] = status
-        finding["http_status"] = http_status.get(finding["record"])
-        if status == "nxdomain":
-            takeover_candidates.append(f"{entry['line']}  [{service} — NXDOMAIN, likely claimable]")
-            finding["confidence"] = "high"
-        elif finding["http_status"] == "matched":
-            takeover_candidates.append(f"{entry['line']}  [{service} — unclaimed-site page served, likely claimable]")
-            finding["confidence"] = "high"
-        elif status == "resolves":
-            fingerprinted_unconfirmed.append(f"{entry['line']}  [{service} — still resolving]")
-            finding["confidence"] = "fingerprinted-still-resolving"
-        elif status == "unknown":
-            fingerprinted_unconfirmed.append(f"{entry['line']}  [{service} — DNS status unknown]")
-            finding["confidence"] = "fingerprinted-dns-unknown"
-        else:
-            fingerprinted_unconfirmed.append(f"{entry['line']}  [{service} — DNS check skipped]")
-            finding["confidence"] = "fingerprinted-unverified"
-
-    dangling_count = (
-        sum(len(v) for v in grouped.values())
-        + len(takeover_candidates)
-        + len(fingerprinted_unconfirmed)
-        + len(unclassified_external)
-        + len(missing_secondary)
-    )
-
-    if dangling_count == 0:
-        click.echo("No dangling DNS records found!")
-    else:
-        for label in _TARGET_ORDER:
-            if label == "External":
-                continue
-            entries = grouped[label]
-            if not entries:
-                continue
-            click.echo(f"\n=== Targets on {label} ({len(entries)}) ===")
-            for line in entries:
-                click.echo(line)
-
-        external_total = len(takeover_candidates) + len(fingerprinted_unconfirmed) + len(unclassified_external)
-        if external_total:
-            click.echo(f"\n=== Targets on External / third-party (SaaS, bare IPs) ({external_total}) ===")
-            if takeover_candidates:
-                click.echo(f"\n  --- HIGH CONFIDENCE: fingerprinted SaaS target is unclaimed ({len(takeover_candidates)}) ---")
-                for line in takeover_candidates:
-                    click.echo(line)
-            if fingerprinted_unconfirmed:
-                click.echo(f"\n  --- Fingerprinted SaaS target, not confirmed dangling ({len(fingerprinted_unconfirmed)}) ---")
-                for line in fingerprinted_unconfirmed:
-                    click.echo(line)
-            if unclassified_external:
-                click.echo(f"\n  --- Unclassified third-party target ({len(unclassified_external)}) ---")
-                for line in unclassified_external:
-                    click.echo(line)
-
-        if missing_secondary:
-            click.echo(f"\n=== Mail, SRV and SPF targets that do not exist (NXDOMAIN) ({len(missing_secondary)}) ===")
-            for line in missing_secondary:
-                click.echo(line)
-
-        click.echo(f"\nTotal dangling DNS records found: {dangling_count}")
-
-    if hidden_internal:
-        click.echo(
-            f"\n({hidden_internal} record(s) pointing at private/internal addresses "
-            "hidden \u2014 not takeover risks; use the dump file to see them)"
-        )
+    findings, hidden_internal = result["findings"], result["hidden_internal"]
+    _print_findings(findings, hidden_internal)
 
     if COLLECTION_ERRORS:
         click.echo(
@@ -856,7 +881,10 @@ def main():
             click.echo("  (this scan is incomplete, so some 'resolved' findings may just be unscanned)")
 
     if args.json_file:
-        _write_json_report(args.json_file, findings, hidden_internal, COLLECTION_ERRORS, diff)
+        _write_json_report(args.json_file, findings, hidden_internal, COLLECTION_ERRORS, diff, args.json_format)
+
+    if args.security_hub:
+        _send_to_security_hub(findings, diff["resolved"] if diff else ())
 
     if webhooks:
         alert = _build_alert(
@@ -1004,9 +1032,11 @@ def _summarise_errors(errors):
     return sorted(counts.items())
 
 
-def _write_json_report(path, findings, hidden_internal, collection_errors=(), diff=None):
-    """Write findings as JSON to a path, or to stdout when path is '-'."""
-    report = {
+def _write_json_report(path, findings, hidden_internal, collection_errors=(), diff=None, fmt="findmytakeover"):
+    """Write findings as JSON to a path, or to stdout when path is '-'. `fmt`
+    picks the native report, OCSF Detection Findings or DefectDojo's generic
+    import format."""
+    report = _export(fmt, findings) if fmt != "findmytakeover" else {
         "tool": "findmytakeover",
         "version": _version(),
         "summary": {
@@ -1022,7 +1052,7 @@ def _write_json_report(path, findings, hidden_internal, collection_errors=(), di
         "collection_errors": list(collection_errors),
         "findings": findings,
     }
-    if diff is not None:
+    if diff is not None and fmt == "findmytakeover":
         report["summary"]["new"] = len(diff["new"])
         report["summary"]["resolved"] = len(diff["resolved"])
         report["resolved"] = diff["resolved"]
@@ -1039,6 +1069,279 @@ def _write_json_report(path, findings, hidden_internal, collection_errors=(), di
         sys.exit(1)
 
     click.echo(f"\nJSON report written to {path} ({len(findings)} finding(s))")
+
+
+# --- Export formats ---------------------------------------------------------
+
+# Severity by confidence: how likely the record can be claimed today.
+_SEVERITY = {
+    "high": "High",
+    "inventory-miss": "Medium",
+    "target-nxdomain": "Medium",
+    "fingerprinted-still-resolving": "Low",
+    "fingerprinted-dns-unknown": "Low",
+    "fingerprinted-unverified": "Low",
+    "unclassified-third-party": "Info",
+}
+_OCSF_SEVERITY_ID = {"Info": 1, "Low": 2, "Medium": 3, "High": 4}
+_REMEDIATION = (
+    "Delete the DNS record, or point it back at a resource you own. Re-check the "
+    "record first: it may have been fixed since the scan."
+)
+
+
+def _finding_uid(finding):
+    """Stable id across runs (same key as the baseline), so SIEMs and Security
+    Hub update a finding instead of duplicating it."""
+    return hashlib.sha256("|".join(_finding_key(finding)).encode()).hexdigest()[:32]
+
+
+def _finding_title(f):
+    kind = f"{f['record_type']} " if f.get("record_type") else ""
+    return f"Dangling DNS record {f['record']} -> {kind}{f['target']}"
+
+
+def _finding_description(f):
+    via = f.get("saas_service") or f["target_owner"]
+    return (
+        f"{f['record']} points at {f['target']} ({via}), which was not found in any scanned "
+        f"account (confidence: {f['confidence']}). DNS zone: {f['dns_provider']} {f['account']}."
+    )
+
+
+def _ocsf_finding(f, now):
+    """OCSF 1.3 Detection Finding (class 2004)."""
+    severity = _SEVERITY.get(f["confidence"], "Info")
+    return {
+        "class_uid": 2004,
+        "class_name": "Detection Finding",
+        "category_uid": 2,
+        "category_name": "Findings",
+        "activity_id": 1,
+        "activity_name": "Create",
+        "type_uid": 200401,
+        "severity_id": _OCSF_SEVERITY_ID[severity],
+        "severity": severity,
+        "status_id": 1,
+        "status": "New",
+        "time": int(now.timestamp() * 1000),
+        "message": _finding_title(f),
+        "metadata": {
+            "version": "1.3.0",
+            "product": {"name": "findmytakeover", "vendor_name": "findmytakeover", "version": _version()},
+        },
+        "finding_info": {
+            "uid": _finding_uid(f),
+            "title": _finding_title(f),
+            "desc": _finding_description(f),
+            "types": ["Dangling DNS", "Subdomain Takeover"],
+        },
+        "resources": [{"name": f["record"], "type": "DNS Record", "uid": f["record"]}],
+        "cloud": {"provider": f["dns_provider"], "account": {"uid": f["account"]}},
+        "remediation": {"desc": _REMEDIATION},
+        "unmapped": f,
+    }
+
+
+def _defectdojo_finding(f, now):
+    """DefectDojo 'Generic Findings Import' format."""
+    return {
+        "title": _finding_title(f),
+        "description": _finding_description(f),
+        "severity": _SEVERITY.get(f["confidence"], "Info"),
+        "date": now.strftime("%Y-%m-%d"),
+        "mitigation": _REMEDIATION,
+        "component_name": f["record"],
+        "unique_id_from_tool": _finding_uid(f),
+        "vuln_id_from_tool": f["confidence"],
+        "active": True,
+        "verified": f["confidence"] == "high",
+    }
+
+
+def _export(fmt, findings):
+    now = datetime.now(timezone.utc)
+    if fmt == "ocsf":
+        return [_ocsf_finding(f, now) for f in findings]
+    return {"findings": [_defectdojo_finding(f, now) for f in findings]}
+
+
+def _asff_finding(f, account, region, partition, now, archived=False):
+    """AWS Security Finding Format, imported as the account's own (default) product."""
+    severity = _SEVERITY.get(f["confidence"], "Info").upper()
+    finding = {
+        "SchemaVersion": "2018-10-08",
+        "Id": f"findmytakeover/{_finding_uid(f)}",
+        "ProductArn": f"arn:{partition}:securityhub:{region}:{account}:product/{account}/default",
+        "GeneratorId": "findmytakeover",
+        "AwsAccountId": account,
+        "Types": ["Software and Configuration Checks/Vulnerabilities"],
+        "CreatedAt": now,
+        "UpdatedAt": now,
+        "Severity": {"Label": "INFORMATIONAL" if severity == "INFO" else severity},
+        "Title": _finding_title(f)[:256],
+        "Description": _finding_description(f)[:1024],
+        "Remediation": {"Recommendation": {"Text": _REMEDIATION}},
+        "Resources": [{
+            "Type": "Other",
+            "Id": f["record"],
+            "Details": {"Other": {
+                k: str(f.get(k) or "")[:1024]
+                for k in ("target", "record_type", "confidence", "dns_provider", "account", "target_owner")
+            }},
+        }],
+        "RecordState": "ARCHIVED" if archived else "ACTIVE",
+    }
+    return finding
+
+
+def _send_to_security_hub(findings, resolved=(), session=None):
+    """Import findings into Security Hub in the current AWS session's account
+    and region; resolved ones (from --baseline) are archived. Failures are
+    reported but never change the exit status."""
+    try:
+        import boto3
+        from botocore.exceptions import BotoCoreError, ClientError
+
+        session = session or boto3.Session()
+        region = session.region_name
+        if not region:
+            click.echo("Security Hub: no AWS region configured (set AWS_REGION); skipping.")
+            return
+        account = session.client("sts", region_name=region).get_caller_identity()["Account"]
+        partition = session.get_partition_for_region(region)
+        now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.000Z")
+        batch = [_asff_finding(f, account, region, partition, now) for f in findings]
+        batch += [_asff_finding(f, account, region, partition, now, archived=True) for f in resolved]
+        client = session.client("securityhub", region_name=region)
+        failed = 0
+        for i in range(0, len(batch), 100):  # API limit: 100 findings per call
+            failed += client.batch_import_findings(Findings=batch[i:i + 100])["FailedCount"]
+        click.echo(f"Security Hub: imported {len(batch) - failed} finding(s) into {account}/{region}, {failed} failed.")
+    except (BotoCoreError, ClientError) as e:
+        click.echo(f"Warning: Security Hub import failed - {e}")
+
+
+# --- Terraform plan guard -----------------------------------------------------
+
+# Resource types that are DNS records. Their values are what can dangle;
+# everything else in the plan is a potential target.
+_TF_DNS_RECORD_TYPES = frozenset((
+    "aws_route53_record",
+    "google_dns_record_set",
+    "azurerm_dns_a_record", "azurerm_dns_aaaa_record", "azurerm_dns_cname_record",
+    "azurerm_dns_mx_record", "azurerm_dns_ns_record", "azurerm_dns_srv_record",
+    "azurerm_dns_txt_record",
+    "cloudflare_record", "cloudflare_dns_record",
+    "oci_dns_rrset", "oci_dns_record",
+))
+# Top-level record attributes that name the record rather than point anywhere.
+_TF_RECORD_NAME_KEYS = frozenset((
+    "id", "name", "fqdn", "type", "ttl", "zone_id", "zone_name", "managed_zone",
+    "resource_group_name", "project", "zone_name_or_id", "comment", "tags", "tags_all",
+))
+
+
+def _tf_strings(value):
+    """Every string leaf in a plan value."""
+    if isinstance(value, str):
+        yield value
+    elif isinstance(value, dict):
+        for v in value.values():
+            yield from _tf_strings(v)
+    elif isinstance(value, list):
+        for v in value:
+            yield from _tf_strings(v)
+
+
+def _tf_record(rc, values):
+    name = values.get("fqdn") or values.get("hostname") or values.get("name") or rc["address"]
+    rtype = values.get("type") or rc["type"].removeprefix("azurerm_dns_").removesuffix("_record").upper()
+    targets = _tf_strings({k: v for k, v in values.items() if k not in _TF_RECORD_NAME_KEYS})
+    return str(name), str(rtype), targets
+
+
+def _terraform_dangling(plan, live_records=()):
+    """DNS records that would dangle once `plan` (terraform show -json) applies:
+    a record, kept by the plan or live in DNS, whose value is an endpoint of a
+    resource the plan destroys and doesn't recreate at the same address.
+
+    Endpoints are matched generically: every string in the destroyed
+    resource's state (hostnames, IPs, bucket names, name servers) is a
+    candidate, so new resource types need no code.
+    # ponytail: generic string match; per-type endpoint attributes if it ever
+    # produces noise.
+    """
+    destroyed, kept, records, deleted_records = {}, set(), [], set()
+    for rc in plan.get("resource_changes", []):
+        change = rc.get("change", {})
+        actions = change.get("actions", [])
+        before, after = change.get("before") or {}, change.get("after") or {}
+        if rc.get("type") in _TF_DNS_RECORD_TYPES:
+            if actions == ["delete"]:
+                name, rtype, _ = _tf_record(rc, before)
+                deleted_records.add((name.rstrip(".").lower(), rtype))
+            elif after:
+                name, rtype, targets = _tf_record(rc, after)
+                records += [("terraform", rc["address"], name, t, rtype) for t in targets]
+            continue
+        if "delete" in actions:
+            for s in _tf_strings(before):
+                if "." in s or ":" in s:
+                    destroyed.setdefault(_match_key(s), rc["address"])
+        kept.update(_match_key(s) for s in _tf_strings(after))
+
+    findings = []
+    for source, where, name, target, rtype in [*records, *live_records]:
+        if (str(name).rstrip(".").lower(), rtype) in deleted_records:
+            continue  # the plan removes this record too
+        key = _match_key(target)
+        if key in destroyed and key not in kept:
+            findings.append({
+                "record": str(name).rstrip("."),
+                "record_type": rtype,
+                "target": str(target).rstrip("."),
+                "source": f"{source} {where}",
+                "destroyed_by": destroyed[key],
+            })
+    return findings
+
+
+def _terraform_guard(args):
+    """--terraform-plan: fail (exit 1) if applying the plan leaves DNS dangling."""
+    try:
+        with open(args.terraform_plan) as handle:
+            plan = json.load(handle)
+    except (OSError, ValueError) as e:
+        click.echo(f"Could not read Terraform plan {args.terraform_plan}: {e}")
+        return 1
+
+    live = []
+    if os.path.exists(args.config_file):
+        click.echo(f"Reading live DNS using {args.config_file}")
+        dns_config, _, _ = read_config(args.config_file)
+        live = _collect_dns_records(dns_config)
+    else:
+        click.echo("No config file; checking only the DNS records in the plan.")
+
+    findings = _terraform_dangling(plan, live)
+    for f in findings:
+        click.echo(
+            f"  {f['record']} -> {f['record_type']} {f['target']} "
+            f"[{f['source']}] would dangle: {f['destroyed_by']} is destroyed"
+        )
+    click.echo(
+        f"\n{len(findings)} DNS record(s) would dangle after this plan."
+        if findings else "No DNS record would dangle after this plan."
+    )
+    if args.json_file:
+        payload = {"tool": "findmytakeover", "version": _version(), "findings": findings}
+        if args.json_file == "-":
+            click.echo(json.dumps(payload, indent=2))
+        else:
+            with open(args.json_file, "w") as handle:
+                json.dump(payload, handle, indent=2)
+    return 1 if findings else 0
 
 
 if __name__ == "__main__":
