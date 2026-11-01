@@ -107,7 +107,7 @@ click==8.5.0
     # via findmytakeover (pyproject.toml)
 cloudflare==5.9.0
     # via findmytakeover (pyproject.toml)
-crc32c==2.8
+crc32c==2.9.post0
     # via oci
 cryptography==50.0.2
     # via
@@ -309,7 +309,7 @@ python-dateutil==2.9.0.post0
     #   botocore
     #   oci
     #   pandas
-python-pkcs11==0.9.4
+python-pkcs11==0.10.1
     # via oci
 pytz==2026.6
     # via oci
