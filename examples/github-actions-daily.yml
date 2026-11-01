@@ -30,6 +30,9 @@ concurrency:
 jobs:
   scan:
     runs-on: ubuntu-latest
+    # A hard ceiling for the whole run. API calls have their own timeouts and
+    # bounded retries, but a cap here keeps a stuck run from burning hours.
+    timeout-minutes: 60
     env:
       GH_TOKEN: ${{ github.token }}
     steps:

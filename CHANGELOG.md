@@ -38,9 +38,41 @@ they summarise the shape of each release rather than listing every commit.
 - **`findmytakeover.scan()`** as a library entry point, returning the same
   findings as `--json`.
 
+- **Faster collection.** Providers, and DNS vs inventory, are collected
+  concurrently. AWS runs every (account, region, service) as its own task and
+  caches clients. Azure lists each resource type subscription-wide (one paged
+  call instead of one per resource group) and runs subscriptions and resource
+  types in parallel. Per-provider timings are printed.
+- **NXDOMAIN confirmation**: a public resolver that can find the name overrules
+  the system resolver's NXDOMAIN (split-horizon DNS), and inconclusive lookups
+  are retried once. `FINDMYTAKEOVER_CONFIRM_RESOLVERS` configures it.
+- `requirements-lock.txt`, used by the Docker image for reproducible builds.
+- An end-to-end AWS test against moto.
+
 ### Changed
 
 - Console findings print record names without the trailing dot.
+- Dependencies are version ranges instead of exact pins, so `pip install`
+  coexists with other packages.
+- `azure-mgmt-resource` is no longer a dependency.
+- Azure: VM, load balancer and application gateway endpoints are collected as
+  the public IP resources they use (labelled `publicip` in the dump). Same
+  values, three fewer listings per resource group.
+- Azure: an `AuthorizationFailed` is now reported as a collection gap instead
+  of skipped silently; an unregistered resource provider is still skipped.
+
+### Fixed
+
+- Assumed AWS role credentials expired after an hour, failing every later call
+  in a long scan; they now refresh.
+- One unexpected error in an AWS or Azure service collector aborted that
+  provider's whole inventory; it now costs only that service.
+- One Azure failure lost the whole subscription's inventory.
+- boto3 clients were created from boto3's shared default session across
+  threads, which isn't thread-safe.
+- API calls had no retry or timeout configuration: AWS now retries
+  adaptively on throttling, Cloudflare retries 6 times, and AWS/Azure/Cloudflare
+  calls have connect/read timeouts.
 
 ## [3.0.0] — 2026-10-31
 

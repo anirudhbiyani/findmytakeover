@@ -7,6 +7,7 @@ import json
 import os
 import re
 import sys
+import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 from urllib.parse import urlparse
@@ -193,61 +194,62 @@ def _parse_providers(config, section):
     return providers
 
 
-def _collect_dns_records(dns_config):
-    """Collect DNS records from all configured providers."""
-    records = []
+def _collect(section, kind):
+    """Run every configured provider's `kind` collector ("dns" or "infra")
+    concurrently and return {provider: rows}. Providers are independent, so
+    the section takes as long as its slowest provider, not their sum."""
+    noun = "DNS records" if kind == "dns" else "infrastructure"
 
-    for provider, config in dns_config.items():
-        if provider not in _SUPPORTED_PROVIDERS:
-            click.echo(
-                f"The DNS provider '{provider}' is not supported. Please read the documentation."
-            )
-            continue
-
+    def run(provider, config):
         provider_name = _PROVIDER_NAMES[provider]
+        started = time.monotonic()
         try:
             collector = _get_collector(provider)
-            data = collector.dns(config["accounts"], config["credentials"], **config.get("options", {}))
+            rows = getattr(collector, kind)(
+                config["accounts"], config["credentials"], **config.get("options", {})
+            )
         except Exception as e:
             # One broken provider shouldn't cost the others' results.
-            note_error(provider_name, "(all accounts)", "DNS records", e)
-            continue
-        # Rows are [account, name, value] or, for MX/SRV/TXT, [account, name, value, type].
-        provider_records = [
-            [provider_name, item[0], item[1], item[2], item[3] if len(item) > 3 else ""]
-            for item in data
-        ]
-        click.echo(f"Collected {len(provider_records)} DNS record(s) from {provider_name}")
-        records.extend(provider_records)
+            note_error(provider_name, "(all accounts)", noun, e)
+            return provider_name, []
+        unit = "DNS record(s)" if kind == "dns" else "infrastructure resource(s)"
+        click.echo(
+            f"Collected {len(rows)} {unit} from {provider_name} "
+            f"in {time.monotonic() - started:.1f}s"
+        )
+        return provider_name, rows
 
+    providers = []
+    for provider, config in section.items():
+        if provider in _SUPPORTED_PROVIDERS:
+            providers.append((provider, config))
+        else:
+            click.echo(f"The provider '{provider}' is not supported. Please read the documentation.")
+    if not providers:
+        return {}
+    with ThreadPoolExecutor(max_workers=len(providers)) as pool:
+        return dict(pool.map(lambda p: run(*p), providers))
+
+
+def _collect_dns_records(dns_config):
+    """Collect DNS records from all configured providers."""
+    # Rows are [account, name, value] or, for MX/SRV/TXT, [account, name, value, type].
+    records = [
+        [provider_name, item[0], item[1], item[2], item[3] if len(item) > 3 else ""]
+        for provider_name, rows in _collect(dns_config, "dns").items()
+        for item in rows
+    ]
     click.echo(f"Total DNS records collected: {len(records)}")
     return records
 
 
 def _collect_infrastructure(infra_config):
     """Collect infrastructure data from all configured providers."""
-    infrastructure = []
-
-    for provider, config in infra_config.items():
-        if provider not in _SUPPORTED_PROVIDERS:
-            click.echo(
-                f"The Infrastructure provider '{provider}' is not supported. Please read the documentation."
-            )
-            continue
-
-        provider_name = _PROVIDER_NAMES[provider]
-        try:
-            collector = _get_collector(provider)
-            data = collector.infra(config["accounts"], config["credentials"], **config.get("options", {}))
-        except Exception as e:
-            note_error(provider_name, "(all accounts)", "infrastructure", e)
-            continue
-        provider_infra = [
-            [provider_name, item[0], item[1], item[2]] for item in data
-        ]
-        click.echo(f"Collected {len(provider_infra)} infrastructure resource(s) from {provider_name}")
-        infrastructure.extend(provider_infra)
-
+    infrastructure = [
+        [provider_name, item[0], item[1], item[2]]
+        for provider_name, rows in _collect(infra_config, "infra").items()
+        for item in rows
+    ]
     click.echo(f"Total infrastructure resources collected: {len(infrastructure)}")
     return infrastructure
 
@@ -333,13 +335,46 @@ def _classify_target(value):
     return "External"
 
 
-def _make_resolver():
+# Public resolvers that must agree before an NXDOMAIN counts. The system
+# resolver may sit behind split-horizon DNS (a VPN, a corporate resolver) that
+# answers NXDOMAIN for names that exist on the internet. Override with
+# FINDMYTAKEOVER_CONFIRM_RESOLVERS (comma-separated); empty disables.
+_CONFIRM_RESOLVERS = ("1.1.1.1", "8.8.8.8")
+
+
+def _make_resolver(nameserver=None):
     """Build a dnspython resolver with short, bounded timeouts so a slow or
-    blackholed name can never hang the run."""
-    resolver = dns.resolver.Resolver()
+    blackholed name can never hang the run. Uses the system resolver unless
+    a nameserver is given."""
+    if nameserver:
+        resolver = dns.resolver.Resolver(configure=False)
+        resolver.nameservers = [nameserver]
+    else:
+        resolver = dns.resolver.Resolver()
     resolver.timeout = _DNS_QUERY_TIMEOUT
     resolver.lifetime = _DNS_LIFETIME
     return resolver
+
+
+def _confirm_resolvers():
+    configured = os.environ.get("FINDMYTAKEOVER_CONFIRM_RESOLVERS")
+    names = _CONFIRM_RESOLVERS if configured is None else [n.strip() for n in configured.split(",") if n.strip()]
+    return [_make_resolver(n) for n in names]
+
+
+def _checked_status(resolver, confirmers, hostname):
+    """_resolve_hostname_status, made robust: an inconclusive answer is retried
+    once, and an NXDOMAIN is overruled if any public resolver finds the name.
+    A public resolver that can't be reached doesn't veto (some networks block
+    outbound DNS), so the result then rests on the system resolver alone."""
+    status = _resolve_hostname_status(resolver, hostname)
+    if status == "unknown":
+        status = _resolve_hostname_status(resolver, hostname)
+    if status == "nxdomain" and any(
+        _resolve_hostname_status(r, hostname) == "resolves" for r in confirmers
+    ):
+        return "resolves"
+    return status
 
 
 def _resolve_hostname_status(resolver, hostname):
@@ -379,9 +414,10 @@ def _verify_dns_targets(hostnames):
 
     unique = sorted({str(h).rstrip(".").lower() for h in hostnames})
     resolver = _make_resolver()
+    confirmers = _confirm_resolvers()
     results = {}
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as pool:
-        futures = {pool.submit(_resolve_hostname_status, resolver, h): h for h in unique}
+        futures = {pool.submit(_checked_status, resolver, confirmers, h): h for h in unique}
         for future in as_completed(futures):
             hostname = futures[future]
             try:
@@ -520,12 +556,18 @@ def scan(dns_config, infra_config, exclusions=None, verify_dns=True, verify_http
     console.
     """
     COLLECTION_ERRORS.clear()  # errors belong to this scan, not an earlier one
-    records_df = pd.DataFrame(
-        _collect_dns_records(dns_config), columns=["csp", "account", "dnskey", "dnsvalue", "rtype"]
-    )
-    infrastructure_df = pd.DataFrame(
-        _collect_infrastructure(infra_config), columns=["csp", "account", "service", "value"]
-    )
+    started = time.monotonic()
+    # DNS and inventory don't depend on each other: collect both at once.
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        records = pool.submit(_collect_dns_records, dns_config)
+        infrastructure = pool.submit(_collect_infrastructure, infra_config)
+        records_df = pd.DataFrame(
+            records.result(), columns=["csp", "account", "dnskey", "dnsvalue", "rtype"]
+        )
+        infrastructure_df = pd.DataFrame(
+            infrastructure.result(), columns=["csp", "account", "service", "value"]
+        )
+    click.echo(f"Collection took {time.monotonic() - started:.1f}s")
 
     if dump_file:
         click.echo(f"Dumping data to file - {dump_file}")

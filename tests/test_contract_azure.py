@@ -156,18 +156,8 @@ def test_trap_class_level_hasattr_misses_operation_groups():
 
 
 # --------------------------------------------------------------------------
-# ResourceManagementClient / SubscriptionClient - subscription & RG plumbing
+# SubscriptionClient - subscription discovery
 # --------------------------------------------------------------------------
-
-
-def test_resource_management_client_contract():
-    pytest.importorskip("azure.mgmt.resource")
-    from azure.mgmt.resource.resources import ResourceManagementClient
-    from azure.mgmt.resource.resources.operations import ResourceGroupsOperations
-    from azure.mgmt.resource.resources.models import ResourceGroup
-
-    _assert_operation(ResourceManagementClient, "resource_groups", ResourceGroupsOperations, "list")
-    _assert_fields(ResourceGroup(location="eastus"), "name")
 
 
 def test_subscription_client_contract():
@@ -202,12 +192,12 @@ def test_dns_management_client_contract():
         SubResource,
     )
 
-    _assert_operation(DnsManagementClient, "zones", ZonesOperations, "list_by_resource_group")
+    _assert_operation(DnsManagementClient, "zones", ZonesOperations, "list")
     _assert_operation(
         DnsManagementClient, "record_sets", RecordSetsOperations, "list_by_dns_zone"
     )
 
-    _assert_fields(Zone(location="global"), "name")
+    _assert_fields(Zone(location="global"), "name", "id")
     _assert_fields(
         RecordSet(),
         "fqdn",
@@ -238,26 +228,11 @@ def test_dns_management_client_contract():
 def test_network_management_client_contract():
     pytest.importorskip("azure.mgmt.network")
     from azure.mgmt.network import NetworkManagementClient
-    from azure.mgmt.network.operations import (
-        PublicIPAddressesOperations,
-        NetworkInterfacesOperations,
-        LoadBalancersOperations,
-        ApplicationGatewaysOperations,
-    )
-    from azure.mgmt.network.models import (
-        PublicIPAddress,
-        PublicIPAddressDnsSettings,
-        NetworkInterface,
-        NetworkInterfaceIPConfiguration,
-        LoadBalancer,
-        FrontendIPConfiguration,
-        ApplicationGateway,
-        ApplicationGatewayFrontendIPConfiguration,
-        SubResource,
-    )
+    from azure.mgmt.network.operations import PublicIPAddressesOperations
+    from azure.mgmt.network.models import PublicIPAddress, PublicIPAddressDnsSettings
 
     _assert_operation(
-        NetworkManagementClient, "public_ip_addresses", PublicIPAddressesOperations, "list"
+        NetworkManagementClient, "public_ip_addresses", PublicIPAddressesOperations, "list_all"
     )
     _assert_operation(
         NetworkManagementClient,
@@ -265,29 +240,8 @@ def test_network_management_client_contract():
         PublicIPAddressesOperations,
         "list_virtual_machine_scale_set_public_ip_addresses",
     )
-    _assert_operation(
-        NetworkManagementClient, "network_interfaces", NetworkInterfacesOperations, "list"
-    )
-    _assert_operation(NetworkManagementClient, "load_balancers", LoadBalancersOperations, "list")
-    _assert_operation(
-        NetworkManagementClient, "application_gateways", ApplicationGatewaysOperations, "list"
-    )
-
     _assert_fields(PublicIPAddress(), "ip_address", "dns_settings", "id")
     _assert_fields(PublicIPAddressDnsSettings(), "fqdn")  # ip.dns_settings.fqdn
-    _assert_fields(NetworkInterface(), "id", "ip_configurations")
-    _assert_fields(
-        NetworkInterfaceIPConfiguration(), "public_ip_address"
-    )  # nic.ip_configurations[].public_ip_address.id
-    _assert_fields(LoadBalancer(), "frontend_ip_configurations")
-    _assert_fields(
-        FrontendIPConfiguration(), "public_ip_address"
-    )  # lb.frontend_ip_configurations[].public_ip_address
-    _assert_fields(ApplicationGateway(), "frontend_ip_configurations")
-    _assert_fields(
-        ApplicationGatewayFrontendIPConfiguration(), "public_ip_address"
-    )  # gw.frontend_ip_configurations[].public_ip_address
-    _assert_fields(SubResource(), "id")  # public_ip_address.id / nic_ref.id
 
 
 # --------------------------------------------------------------------------
@@ -304,9 +258,9 @@ def test_cdn_management_client_contract():
         AFDEndpointsOperations,
         AFDCustomDomainsOperations,
     )
-    from azure.mgmt.cdn.models import Endpoint, AFDEndpoint, AFDDomain
+    from azure.mgmt.cdn.models import Endpoint, AFDEndpoint, AFDDomain, Profile
 
-    _assert_operation(CdnManagementClient, "profiles", ProfilesOperations, "list_by_resource_group")
+    _assert_operation(CdnManagementClient, "profiles", ProfilesOperations, "list")
     _assert_operation(CdnManagementClient, "endpoints", EndpointsOperations, "list_by_profile")
     _assert_operation(
         CdnManagementClient, "afd_endpoints", AFDEndpointsOperations, "list_by_profile"
@@ -318,6 +272,7 @@ def test_cdn_management_client_contract():
     _assert_fields(Endpoint(location="eastus"), "host_name", "id")
     _assert_fields(AFDEndpoint(location="eastus"), "host_name", "id")
     _assert_fields(AFDDomain(), "host_name")
+    _assert_fields(Profile(location="global", sku=None), "id", "name")  # resource group from id
 
 
 # --------------------------------------------------------------------------
@@ -332,7 +287,7 @@ def test_trafficmanager_client_contract():
     from azure.mgmt.trafficmanager.models import Profile, DnsConfig
 
     _assert_operation(
-        TrafficManagerManagementClient, "profiles", ProfilesOperations, "list_by_resource_group"
+        TrafficManagerManagementClient, "profiles", ProfilesOperations, "list_by_subscription"
     )
     _assert_fields(Profile(), "dns_config", "id")
     _assert_fields(DnsConfig(), "fqdn")
@@ -370,7 +325,7 @@ def test_storage_management_client_contract():
         StorageManagementClient,
         "storage_accounts",
         StorageAccountsOperations,
-        "list_by_resource_group",
+        "list",
     )
     _assert_fields(StorageAccount(), "primary_endpoints", "secondary_endpoints")
     _assert_fields(Endpoints(), "blob", "queue", "table", "file", "web", "dfs")
@@ -394,7 +349,7 @@ def test_apimanagement_client_contract():
         ApiManagementClient,
         "api_management_service",
         ApiManagementServiceOperations,
-        "list_by_resource_group",
+        "list",
     )
     # ApiManagementServiceResource requires sku/location/publisher_* to
     # construct (no zero-arg form) - supply the minimal required set.
@@ -418,7 +373,7 @@ def test_sql_management_client_contract():
     from azure.mgmt.sql.operations import ServersOperations
     from azure.mgmt.sql.models import Server
 
-    _assert_operation(SqlManagementClient, "servers", ServersOperations, "list_by_resource_group")
+    _assert_operation(SqlManagementClient, "servers", ServersOperations, "list")
     _assert_fields(Server(), "fully_qualified_domain_name")
 
 
@@ -437,7 +392,7 @@ def test_containerregistry_client_contract():
         ContainerRegistryManagementClient,
         "registries",
         RegistriesOperations,
-        "list_by_resource_group",
+        "list",
     )
     _assert_fields(Registry(location="eastus", sku=None), "login_server")
 
@@ -457,7 +412,7 @@ def test_containerinstance_client_contract():
         ContainerInstanceManagementClient,
         "container_groups",
         ContainerGroupsOperations,
-        "list_by_resource_group",
+        "list",
     )
     _assert_fields(
         ContainerGroup(containers=[], os_type="Linux"), "ip_address"
@@ -477,7 +432,7 @@ def test_cognitivesearch_client_contract():
     from azure.mgmt.search.models import SearchService
 
     _assert_operation(
-        SearchManagementClient, "services", ServicesOperations, "list_by_resource_group"
+        SearchManagementClient, "services", ServicesOperations, "list_by_subscription"
     )
     _assert_fields(SearchService(location="eastus"), "name", "endpoint")
 
@@ -493,7 +448,7 @@ def test_redis_client_contract():
     from azure.mgmt.redis.operations import RedisOperations
     from azure.mgmt.redis.models import RedisResource
 
-    _assert_operation(RedisManagementClient, "redis", RedisOperations, "list_by_resource_group")
+    _assert_operation(RedisManagementClient, "redis", RedisOperations, "list_by_subscription")
     _assert_fields(RedisResource(location="eastus", sku=None), "host_name")
 
 
@@ -505,44 +460,16 @@ def test_redis_client_contract():
 def test_compute_client_contract():
     pytest.importorskip("azure.mgmt.compute")
     from azure.mgmt.compute import ComputeManagementClient
-    from azure.mgmt.compute.operations import (
-        VirtualMachinesOperations,
-        VirtualMachineScaleSetsOperations,
-    )
-    from azure.mgmt.compute.models import (
-        VirtualMachine,
-        NetworkProfile,
-        NetworkInterfaceReference,
-        VirtualMachineScaleSet,
-    )
+    from azure.mgmt.compute.operations import VirtualMachineScaleSetsOperations
+    from azure.mgmt.compute.models import VirtualMachineScaleSet
 
-    _assert_operation(
-        ComputeManagementClient, "virtual_machines", VirtualMachinesOperations, "list"
-    )
     _assert_operation(
         ComputeManagementClient,
         "virtual_machine_scale_sets",
         VirtualMachineScaleSetsOperations,
-        "list",
+        "list_all",
     )
-
-    _assert_fields(VirtualMachine(location="eastus"), "network_profile")
-    _assert_fields(NetworkProfile(), "network_interfaces")
-    _assert_fields(NetworkInterfaceReference(), "id")  # nic_ref.id
-    _assert_fields(VirtualMachineScaleSet(location="eastus"), "name")
-
-    # Also used off the network client for VMSS public IPs - covered again
-    # here since _collect_vm_data depends on it directly.
-    pytest.importorskip("azure.mgmt.network")
-    from azure.mgmt.network import NetworkManagementClient
-    from azure.mgmt.network.operations import PublicIPAddressesOperations
-
-    _assert_operation(
-        NetworkManagementClient,
-        "public_ip_addresses",
-        PublicIPAddressesOperations,
-        "list_virtual_machine_scale_set_public_ip_addresses",
-    )
+    _assert_fields(VirtualMachineScaleSet(location="eastus"), "name", "id")
 
 
 # --------------------------------------------------------------------------
@@ -560,7 +487,7 @@ def test_aks_client_contract():
         ContainerServiceClient,
         "managed_clusters",
         ManagedClustersOperations,
-        "list_by_resource_group",
+        "list",
     )
     _assert_fields(ManagedCluster(location="eastus"), "fqdn", "private_fqdn")
 
@@ -580,7 +507,7 @@ def test_containerapps_client_contract():
         ContainerAppsAPIClient,
         "container_apps",
         ContainerAppsOperations,
-        "list_by_resource_group",
+        "list_by_subscription",
     )
     _assert_fields(
         ContainerApp(location="eastus"), "configuration", "latest_revision_fqdn"
@@ -604,7 +531,7 @@ def test_cosmosdb_client_contract():
         CosmosDBManagementClient,
         "database_accounts",
         DatabaseAccountsOperations,
-        "list_by_resource_group",
+        "list",
     )
     _assert_fields(DatabaseAccountGetResults(location="eastus"), "document_endpoint")
 

@@ -205,13 +205,15 @@ def test_verify_dns_targets_dedupes_and_classifies():
     stub.resolve = counting_resolve
 
     original_make_resolver = findmytakeover._make_resolver
-    findmytakeover._make_resolver = lambda: stub
+    findmytakeover._make_resolver = lambda nameserver=None: stub
+    os.environ["FINDMYTAKEOVER_CONFIRM_RESOLVERS"] = ""  # no public confirmation here
     try:
         statuses = _verify_dns_targets(
             ["gone.github.io", "gone.github.io.", "GONE.GITHUB.IO", "live.herokuapp.com"]
         )
     finally:
         findmytakeover._make_resolver = original_make_resolver
+        del os.environ["FINDMYTAKEOVER_CONFIRM_RESOLVERS"]
 
     assert statuses == {"gone.github.io": "nxdomain", "live.herokuapp.com": "resolves"}
     # Each unique (normalized) hostname is resolved exactly once, even though
@@ -467,22 +469,29 @@ def test_aws_region_collectors_are_isolated():
         raise EndpointConnectionError(endpoint_url="https://x")
         yield
 
+    def broken(make):
+        raise TypeError("unexpected response shape")
+        yield
+
     def works(make):
         yield "lb.example.elb.amazonaws.com"
         yield None
 
-    original = aws._REGIONAL_COLLECTORS
     collector.COLLECTION_ERRORS.clear()
-    aws._REGIONAL_COLLECTORS = (("a", denied), ("b", not_offered), ("c", works))
-    try:
-        rows = aws._collect_region_infra("111122223333", "default", "us-east-1")
-    finally:
-        aws._REGIONAL_COLLECTORS = original
+    rows = [
+        row
+        for label, collect in (("a", denied), ("b", not_offered), ("d", broken), ("c", works))
+        for row in aws._run_collector("default", "111122223333", "us-east-1", label, collect)
+    ]
     errors = list(collector.COLLECTION_ERRORS)
     collector.COLLECTION_ERRORS.clear()
     assert rows == [["111122223333", "c", "lb.example.elb.amazonaws.com"]]
     # A denied API is a gap worth reporting; a service absent from the region isn't.
-    assert [(e["what"], e["error"]) for e in errors] == [("a", "An error occurred (AccessDenied) when calling the Describe operation: no")]
+    # An unexpected exception is a gap too, not a crash of the whole pool.
+    assert [(e["what"], e["error"]) for e in errors] == [
+        ("a", "An error occurred (AccessDenied) when calling the Describe operation: no"),
+        ("d", "unexpected response shape"),
+    ]
 
 
 def test_aws_govcloud_partition():
@@ -772,3 +781,68 @@ def test_terraform_plan_guard():
         ("site.example.com", "aws_s3_bucket.site"),
     }
     assert findmytakeover._terraform_dangling({"resource_changes": []}) == []
+
+
+def test_nxdomain_needs_public_resolvers_to_agree():
+    if not _DNSPYTHON_AVAILABLE:
+        return
+    system = _StubResolver({"gone.github.io": "nxdomain", "internal-only.github.io": "nxdomain"})
+    public = _StubResolver({"gone.github.io": "nxdomain", "internal-only.github.io": "ok"})
+    blocked = _StubResolver({"gone.github.io": "timeout", "internal-only.github.io": "timeout"})
+    check = findmytakeover._checked_status
+    assert check(system, [public], "gone.github.io") == "nxdomain"
+    # Split-horizon: NXDOMAIN inside, exists on the internet -> not a finding.
+    assert check(system, [public], "internal-only.github.io") == "resolves"
+    # Public DNS blocked: falls back to the system resolver's answer.
+    assert check(system, [blocked], "gone.github.io") == "nxdomain"
+
+    class _FlakyOnce(_StubResolver):
+        calls = 0
+
+        def resolve(self, name, rdtype):
+            self.calls += 1
+            if self.calls == 1:
+                raise dns.exception.Timeout()
+            return super().resolve(name, rdtype)
+
+    assert check(_FlakyOnce({"gone.github.io": "nxdomain"}), [], "gone.github.io") == "nxdomain"
+
+
+def test_azure_collectors_are_subscription_wide_and_isolated():
+    from types import SimpleNamespace as NS
+
+    from azure.core.exceptions import HttpResponseError
+
+    import collector
+    from collector import msazure
+
+    rg_id = "/subscriptions/s/resourceGroups/rg-1/providers/Microsoft.Cdn/profiles/p"
+    calls = []
+
+    def list_by_profile(resource_group_name, profile_name):
+        calls.append((resource_group_name, profile_name))
+        return [NS(host_name="p.azureedge.net", id=rg_id + "/endpoints/e")]
+
+    clients = {"cdn": NS(
+        profiles=NS(list=lambda: [NS(id=rg_id, name="p")]),
+        endpoints=NS(list_by_profile=list_by_profile),
+    )}
+    rows = msazure._run_collector(clients, "s", "cdn", msazure._cdn_endpoints)
+    assert calls == [("rg-1", "p")]  # resource group taken from the profile's id
+    assert [r[2] for r in rows] == ["p.azureedge.net", collector.zone_key(rg_id + "/endpoints/e")]
+
+    def unregistered(c):
+        raise HttpResponseError(message="(MissingSubscriptionRegistration) not registered")
+        yield
+
+    def denied(c):
+        raise HttpResponseError(message="(AuthorizationFailed) no access")
+        yield
+
+    collector.COLLECTION_ERRORS.clear()
+    assert msazure._run_collector({}, "s", "redis", unregistered) == []
+    assert msazure._run_collector({}, "s", "sql", denied) == []
+    errors = [e["what"] for e in collector.COLLECTION_ERRORS]
+    collector.COLLECTION_ERRORS.clear()
+    # An unregistered provider has no resources; a denied one is a gap.
+    assert errors == ["sql"]

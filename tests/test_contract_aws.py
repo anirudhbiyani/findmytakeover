@@ -95,7 +95,7 @@ def _assert_output_path(service, operation, *path):
 
 # ---------------------------------------------------------------------------
 # Route53 — DNS records + hosted zones (collector.aws._dns_for_account,
-# collector.aws._collect_global_infra)
+# collector.aws._hosted_zones, _s3_buckets, ...)
 # ---------------------------------------------------------------------------
 
 def test_route53_list_hosted_zones():
@@ -134,7 +134,7 @@ def test_route53_list_resource_record_sets():
 
 # ---------------------------------------------------------------------------
 # S3 / CloudFront / Global Accelerator — account-global resources
-# (collector.aws._collect_global_infra)
+# (collector.aws._hosted_zones, _s3_buckets, ...)
 # ---------------------------------------------------------------------------
 
 def test_s3_list_buckets():
@@ -155,7 +155,7 @@ def test_globalaccelerator_list_accelerators():
 
 # ---------------------------------------------------------------------------
 # EC2 — regions + instance public network interfaces
-# (collector.aws.infra, collector.aws._collect_region_infra)
+# (collector.aws.infra, collector.aws._regions and the regional collectors)
 # ---------------------------------------------------------------------------
 
 def test_ec2_describe_regions():
@@ -341,7 +341,7 @@ def test_apprunner_list_services():
 
 
 # ---------------------------------------------------------------------------
-# STS — temporary credentials from assume_role (collector.aws._assume_role,
+# STS — temporary credentials from assume_role (collector.aws._role_credentials,
 # collector.aws._create_client)
 # ---------------------------------------------------------------------------
 
@@ -349,6 +349,7 @@ def test_sts_assume_role():
     _assert_output_path("sts", "AssumeRole", "Credentials", "AccessKeyId")
     _assert_output_path("sts", "AssumeRole", "Credentials", "SecretAccessKey")
     _assert_output_path("sts", "AssumeRole", "Credentials", "SessionToken")
+    _assert_output_path("sts", "AssumeRole", "Credentials", "Expiration")
 
 
 # ---------------------------------------------------------------------------
