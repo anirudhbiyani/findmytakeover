@@ -17,3 +17,12 @@ updates:
       lock-updates:
         patterns: ["*"]
         update-types: ["minor", "patch"]
+    # oci pins these exactly (crc32c, python-pkcs11) or caps them
+    # (python-dateutil<3), and Dependabot bumps lock lines without checking
+    # that. They move when oci does: re-run the uv pip compile from
+    # pyproject.toml.
+    ignore:
+      - dependency-name: "crc32c"
+      - dependency-name: "python-pkcs11"
+      - dependency-name: "python-dateutil"
+        update-types: ["version-update:semver-major"]
