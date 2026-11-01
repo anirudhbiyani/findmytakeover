@@ -7,6 +7,7 @@ import os
 import re
 import sys
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from urllib.parse import urlparse
 
 import click
 import pandas as pd
@@ -565,9 +566,51 @@ def main():
             "requests to your subdomains."
         ),
     )
+    parser.add_argument(
+        "--baseline",
+        metavar="JSON_FILE",
+        help=(
+            "A previous --json report. Findings are marked new or already known, "
+            "fixed ones are listed as resolved, and --fail-on-findings only fails "
+            "on new findings. A missing file counts as an empty baseline (first run)."
+        ),
+    )
+    parser.add_argument(
+        "--fail-on-incomplete",
+        action="store_true",
+        help=(
+            "Exit with status 2 when part of the scan couldn't be collected (a "
+            "denied API, an unreachable account), unless status 1 already applies."
+        ),
+    )
+    parser.add_argument(
+        "--alert-webhook",
+        metavar="URL",
+        action="append",
+        default=[],
+        help=(
+            "POST an alert to this webhook when there's something to act on "
+            "(repeatable). Slack incoming webhooks get a Slack message; any other "
+            "URL gets JSON. Prefer the FINDMYTAKEOVER_ALERT_WEBHOOKS environment "
+            "variable (space-separated) so URLs stay out of process lists and CI logs."
+        ),
+    )
+    parser.add_argument(
+        "--alert-confidence",
+        default=",".join(_DEFAULT_ALERT_CONFIDENCE),
+        help=(
+            "Comma-separated confidence levels that alert, or 'all' "
+            f"(default: {','.join(_DEFAULT_ALERT_CONFIDENCE)}). With --baseline "
+            "only new findings alert."
+        ),
+    )
     parser.add_argument("--version", action="version", version=f"findmytakeover {_version()}")
 
     args = parser.parse_args()
+    webhooks = args.alert_webhook + os.environ.get("FINDMYTAKEOVER_ALERT_WEBHOOKS", "").split()
+
+    # Read the baseline before spending minutes scanning, so a bad path fails fast.
+    baseline = _load_baseline(args.baseline) if args.baseline else None
 
     click.echo(f"Reading the config from file - {args.config_file}")
     dns_config, infra_config, exclusions = read_config(args.config_file)
@@ -799,13 +842,157 @@ def main():
             suffix = f" (x{count})" if count > 1 else ""
             click.echo(f"  {provider} {what}: {error}{suffix}")
 
-    if args.json_file:
-        _write_json_report(args.json_file, findings, hidden_internal, COLLECTION_ERRORS)
+    diff = None
+    if baseline is not None:
+        diff = _compare_with_baseline(findings, baseline)
+        click.echo(
+            f"\n=== Compared with baseline {args.baseline}: "
+            f"{len(diff['new'])} new, {len(diff['resolved'])} resolved ==="
+        )
+        for label, items in (("New", diff["new"]), ("Resolved", diff["resolved"])):
+            for f in items:
+                click.echo(f"  {label}: {f['record']} -> {f['target']} [{f['target_owner']}, {f['confidence']}]")
+        if COLLECTION_ERRORS and diff["resolved"]:
+            click.echo("  (this scan is incomplete, so some 'resolved' findings may just be unscanned)")
 
-    # Opt-in so a scheduled scan or CI job can fail on findings instead of
-    # passing silently. Default stays 0 to keep existing callers working.
-    if args.fail_on_findings and dangling_count:
+    if args.json_file:
+        _write_json_report(args.json_file, findings, hidden_internal, COLLECTION_ERRORS, diff)
+
+    if webhooks:
+        alert = _build_alert(
+            diff["new"] if diff else findings, args.alert_confidence, COLLECTION_ERRORS
+        )
+        if alert:
+            _send_alerts(webhooks, alert)
+
+    sys.exit(_exit_code(args, len(diff["new"]) if diff else len(findings), bool(COLLECTION_ERRORS)))
+
+
+# Confidence levels worth interrupting someone for. The fingerprinted-but-
+# unconfirmed and unclassified tiers are a worklist for the report, not alerts.
+_DEFAULT_ALERT_CONFIDENCE = ("high", "inventory-miss", "target-nxdomain")
+_ALERT_LIST_LIMIT = 20
+_ALERT_TIMEOUT = 10.0
+
+
+def _build_alert(candidates, confidence_filter, collection_errors):
+    """What an alert should say, or None when there's nothing to act on.
+
+    `candidates` are the findings eligible to alert (new ones with --baseline);
+    an incomplete scan alerts on its own, because it silently weakens every
+    other result.
+    """
+    wanted = {c.strip() for c in str(confidence_filter).split(",") if c.strip()}
+    findings = [f for f in candidates if "all" in wanted or f["confidence"] in wanted]
+    if not findings and not collection_errors:
+        return None
+    return {
+        "tool": "findmytakeover",
+        "version": _version(),
+        "findings": findings,
+        "complete": not collection_errors,
+        "collection_errors": [
+            {"provider": p, "what": w, "error": e, "count": n}
+            for (p, w, e), n in _summarise_errors(collection_errors)
+        ],
+    }
+
+
+def _alert_text(alert):
+    """Plain-text rendering of an alert, used for Slack."""
+    lines = []
+    findings = alert["findings"]
+    if findings:
+        lines.append(f"*findmytakeover: {len(findings)} dangling DNS record(s) to act on*")
+        for f in findings[:_ALERT_LIST_LIMIT]:
+            via = f.get("saas_service") or f["target_owner"]
+            kind = f"{f['record_type']} " if f.get("record_type") else ""
+            lines.append(f"• `{f['record']}` → {kind}`{f['target']}` ({via}, {f['confidence']})")
+        if len(findings) > _ALERT_LIST_LIMIT:
+            lines.append(f"…and {len(findings) - _ALERT_LIST_LIMIT} more (see the JSON report)")
+    if not alert["complete"]:
+        lines.append("*Scan incomplete* — results may contain false positives and miss findings:")
+        for e in alert["collection_errors"][:_ALERT_LIST_LIMIT]:
+            count = f" (x{e['count']})" if e["count"] > 1 else ""
+            lines.append(f"• {e['provider']} {e['what']}: {e['error']}{count}")
+    return "\n".join(lines)
+
+
+def _alert_payload(url, alert):
+    """Slack incoming webhooks need {"text": ...}; anything else gets the alert as JSON."""
+    if urlparse(url).hostname == "hooks.slack.com":
+        return {"text": _alert_text(alert)}
+    return alert
+
+
+def _send_alerts(webhooks, alert, session=None):
+    """POST the alert to every webhook. A failed delivery is reported but never
+    changes the exit status: the findings are already in the report."""
+    if session is None:
+        import requests
+
+        session = requests.Session()
+    for url in webhooks:
+        host = urlparse(url).hostname or "webhook"  # never print the URL: it's a secret
+        try:
+            response = session.post(url, json=_alert_payload(url, alert), timeout=_ALERT_TIMEOUT)
+            response.raise_for_status()
+            click.echo(f"Alert sent to {host}.")
+        except Exception as e:
+            click.echo(f"Warning: alert to {host} failed - {type(e).__name__}")
+
+
+def _exit_code(args, failing_findings, incomplete):
+    """0 = clean; 1 = findings (new ones, with --baseline) and --fail-on-findings;
+    2 = incomplete scan and --fail-on-incomplete. Both are opt-in so existing
+    callers keep exit status 0."""
+    if args.fail_on_findings and failing_findings:
+        return 1
+    if args.fail_on_incomplete and incomplete:
+        return 2
+    return 0
+
+
+def _finding_key(finding):
+    """What makes two runs' findings the same finding: the record, its type and
+    where it points. Confidence and DNS status may change between runs."""
+    return (
+        str(finding.get("record", "")).rstrip(".").lower(),
+        finding.get("record_type") or "",
+        str(finding.get("target", "")).rstrip(".").lower(),
+    )
+
+
+def _load_baseline(path):
+    """Findings from an earlier --json report. A missing file is an empty
+    baseline (the first scheduled run); an unreadable one is an error, because
+    silently treating it as empty would re-alert on everything."""
+    try:
+        with open(path) as handle:
+            report = json.load(handle)
+    except FileNotFoundError:
+        click.echo(f"Baseline {path} not found; treating every finding as new.")
+        return []
+    except (OSError, ValueError) as e:
+        click.echo(f"Could not read baseline {path}: {e}")
         sys.exit(1)
+    if not isinstance(report, dict) or not isinstance(report.get("findings"), list):
+        click.echo(f"Baseline {path} is not a findmytakeover --json report.")
+        sys.exit(1)
+    return report["findings"]
+
+
+def _compare_with_baseline(findings, baseline):
+    """Mark each finding new or known (sets finding["new"]) and return
+    {"new": [...], "resolved": [baseline findings no longer present]}."""
+    known = {_finding_key(f) for f in baseline}
+    current = {_finding_key(f) for f in findings}
+    for finding in findings:
+        finding["new"] = _finding_key(finding) not in known
+    return {
+        "new": [f for f in findings if f["new"]],
+        "resolved": [f for f in baseline if _finding_key(f) not in current],
+    }
 
 
 def _summarise_errors(errors):
@@ -817,7 +1004,7 @@ def _summarise_errors(errors):
     return sorted(counts.items())
 
 
-def _write_json_report(path, findings, hidden_internal, collection_errors=()):
+def _write_json_report(path, findings, hidden_internal, collection_errors=(), diff=None):
     """Write findings as JSON to a path, or to stdout when path is '-'."""
     report = {
         "tool": "findmytakeover",
@@ -835,6 +1022,10 @@ def _write_json_report(path, findings, hidden_internal, collection_errors=()):
         "collection_errors": list(collection_errors),
         "findings": findings,
     }
+    if diff is not None:
+        report["summary"]["new"] = len(diff["new"])
+        report["summary"]["resolved"] = len(diff["resolved"])
+        report["resolved"] = diff["resolved"]
 
     if path == "-":
         click.echo(json.dumps(report, indent=2))

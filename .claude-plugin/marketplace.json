@@ -9,7 +9,7 @@
   "plugins": [
     {
       "name": "findmytakeover",
-      "description": "Find dangling DNS records vulnerable to subdomain takeover across AWS, GCP, and Azure.",
+      "description": "Find dangling DNS records vulnerable to subdomain takeover across AWS, Azure, GCP, Cloudflare and Oracle Cloud.",
       "source": "./",
       "category": "security"
     }

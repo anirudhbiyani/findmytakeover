@@ -50,7 +50,10 @@ Depending on the cloud provider, you would need permission read data. The follow
 # findmytakeover --help
 usage: findmytakeover [-h] [-c CONFIG_FILE] [-d DUMP_FILE]
                       [--verify-dns | --no-verify-dns] [--json JSON_FILE]
-                      [--fail-on-findings] [--verify-http] [--version]
+                      [--fail-on-findings] [--verify-http]
+                      [--baseline JSON_FILE] [--fail-on-incomplete]
+                      [--alert-webhook URL]
+                      [--alert-confidence ALERT_CONFIDENCE] [--version]
 
 Find dangling DNS records that may be vulnerable to subdomain takeover
 
@@ -78,6 +81,23 @@ options:
                         takeovers that DNS can't (most SaaS providers wildcard
                         their DNS). Off by default: it sends requests to your
                         subdomains.
+  --baseline JSON_FILE  A previous --json report. Findings are marked new or
+                        already known, fixed ones are listed as resolved, and
+                        --fail-on-findings only fails on new findings. A
+                        missing file counts as an empty baseline (first run).
+  --fail-on-incomplete  Exit with status 2 when part of the scan couldn't be
+                        collected (a denied API, an unreachable account),
+                        unless status 1 already applies.
+  --alert-webhook URL   POST an alert to this webhook when there's something
+                        to act on (repeatable). Slack incoming webhooks get a
+                        Slack message; any other URL gets JSON. Prefer the
+                        FINDMYTAKEOVER_ALERT_WEBHOOKS environment variable
+                        (space-separated) so URLs stay out of process lists
+                        and CI logs.
+  --alert-confidence ALERT_CONFIDENCE
+                        Comma-separated confidence levels that alert, or 'all'
+                        (default: high,inventory-miss,target-nxdomain). With
+                        --baseline only new findings alert.
   --version             show program's version number and exit
 ```
 
@@ -132,6 +152,76 @@ plus a `confidence` field per finding, so alerting can key on
 `confidence == "high"`. Check `summary.complete` as well: when a collector
 couldn't read something (a denied API, an unreachable account), it is `false`
 and `collection_errors` says what's missing.
+
+| Exit status | Meaning |
+|---|---|
+| `0` | Nothing to act on (or neither `--fail-on-*` flag given) |
+| `1` | Findings, with `--fail-on-findings` — only *new* findings when `--baseline` is used |
+| `2` | Part of the scan couldn't be collected, with `--fail-on-incomplete` (and no status 1) |
+
+### Scheduled scanning and alerting
+
+A daily scan only stays useful if it alerts on what *changed*. Pass the previous
+run's report as `--baseline`:
+
+```
+findmytakeover --json findings.json --baseline previous/findings.json \
+  --fail-on-findings --fail-on-incomplete
+```
+
+Each finding gets `"new": true|false`, findings that have disappeared are
+listed under `resolved`, and `summary` gains `new` and `resolved` counts.
+`--fail-on-findings` then fails only when something new appears. A missing
+baseline file counts as empty (the first run); an unreadable one is an error,
+so a broken baseline can't silently re-alert on everything. Findings are
+matched on record, record type and target, so a confidence change alone isn't
+"new". If the current scan is incomplete, some "resolved" findings may only be
+unscanned — the console says so.
+
+[`examples/github-actions-daily.yml`](examples/github-actions-daily.yml) is a
+ready-to-copy GitHub Actions workflow for a repository that holds your config:
+
+- runs daily, authenticating to AWS (and optionally Azure/GCP) with OIDC — no
+  stored keys;
+- uses the previous run's report as the baseline;
+- opens a GitHub issue (label `dangling-dns`) per new finding and closes it
+  when the finding disappears;
+- keeps one "scan incomplete" issue open while permissions are missing;
+- optionally sends [alerts](#alerts) to Slack or any webhook
+  (`FINDMYTAKEOVER_ALERT_WEBHOOKS` secret);
+- fails the run on new findings or an incomplete scan.
+
+The scan needs your cloud credentials, so it belongs in your own repository,
+not this one.
+
+### Alerts
+
+findmytakeover can post alerts itself. Give it one or more webhook URLs,
+preferably through the environment so they stay out of process lists and CI
+logs:
+
+```
+export FINDMYTAKEOVER_ALERT_WEBHOOKS="https://hooks.slack.com/services/T000/B000/XXXX"
+findmytakeover --json findings.json --baseline previous/findings.json
+```
+
+(`--alert-webhook URL`, repeatable, works too.)
+
+- **Slack** incoming webhooks (`hooks.slack.com`) get a readable message.
+- **Any other URL** gets the alert as JSON — `findings`, `complete` and
+  grouped `collection_errors` — for a Teams channel via a Power Automate
+  "When a webhook request is received" flow, a SIEM, or your own handler.
+
+What alerts:
+
+- findings whose confidence is `high`, `inventory-miss` or `target-nxdomain`
+  (change with `--alert-confidence`, or `--alert-confidence all`) — only the
+  **new** ones when `--baseline` is used;
+- an incomplete scan, even with no findings, because it quietly weakens every
+  other result.
+
+Nothing to act on means no message. A failed delivery prints a warning (with
+the host only, never the URL) and doesn't change the exit status.
 
 ### Output
 

@@ -2,153 +2,180 @@
 name: dangling-dns-finder
 description: >-
   Detect dangling DNS records and subdomain-takeover risks across a multi-cloud
-  environment by running the bundled findmytakeover tool. Use whenever the user
-  wants to find dangling domains/records, stale CNAMEs, subdomain takeover
-  exposure, orphaned DNS entries, or audit their DNS zones for records pointing
-  at deleted cloud resources — dead load balancers (ELBs), released
-  EC2/GCP/Azure IPs, or expired SaaS targets. Triggers on "dangling domains",
-  "dangling DNS", "subdomain takeover", "audit my DNS", "find stale/orphaned DNS
-  records", "dead CNAMEs", or asking what's safe to delete. Works across AWS,
-  GCP, and Azure using the accounts the user can already read.
+  environment by running the findmytakeover tool. Use whenever the user wants
+  to find dangling domains/records, stale CNAMEs, subdomain takeover exposure,
+  orphaned DNS entries, or audit their DNS zones for records pointing at
+  deleted cloud resources — dead load balancers, released public IPs, deleted
+  S3 buckets/CloudFront/App Service, or expired SaaS targets (GitHub Pages,
+  Heroku, Shopify...). Triggers on "dangling domains", "dangling DNS",
+  "subdomain takeover", "audit my DNS", "find stale/orphaned DNS records",
+  "dead CNAMEs", "broken MX/SPF", asking what's safe to delete, or setting up a
+  daily/CI scan with alerts. Covers AWS (incl. GovCloud), Azure (incl. Azure
+  Government), GCP, Cloudflare and Oracle Cloud, using read-only access the
+  user already has.
 ---
 
 # Dangling DNS Finder
 
 Find DNS records that point at infrastructure that no longer exists — the
-classic subdomain-takeover setup. A `CNAME` to a deleted ELB, or an `A` record
-to a released cloud IP, can be silently reclaimed by someone else and used to
-serve content under your domain.
+classic subdomain-takeover setup. A `CNAME` to a deleted ELB or S3 bucket, or
+an `A` record to a released cloud IP, can be reclaimed by someone else and
+used to serve content under the user's domain.
 
-This skill drives the repo's own tool, [`findmytakeover.py`](../../findmytakeover.py).
-It enumerates every DNS record **and** every live infrastructure endpoint
-(IPs, ELB/LB hostnames, etc.) across the configured AWS/GCP/Azure accounts,
-then reports any DNS record whose value has **no** matching live resource. No
-wordlists, no guessing — a record is dangling because the thing it points at is
-not in your inventory.
+This skill drives the `findmytakeover` tool. It enumerates every DNS record
+**and** every live infrastructure endpoint across the configured accounts,
+then reports records whose target is in **none** of them. Third-party SaaS
+targets are checked for NXDOMAIN (and optionally an "unclaimed site" page).
+No wordlists, no guessing.
 
-Do **not** write new scripts to resolve DNS or probe endpoints — the tool
-already collects both sides and diffs them. Your job is to configure it, run
-it, and interpret the output.
+Do **not** write your own scripts to enumerate DNS or probe endpoints — the
+tool collects both sides and diffs them. Your job is to configure it, run it,
+and interpret the JSON. The one exception is re-checking a single record with
+`dig` right before remediation (step 5).
 
 ## Prerequisites
 
-- Read-only cloud credentials for the accounts being scanned, already set up in
-  the local CLIs:
-  - **AWS** — `ViewOnlyAccess` + `SecurityAudit` (or an assumable IAM role)
+- **The tool.** Use whichever is available, in this order:
+  - `findmytakeover --version` already works → use it.
+  - Inside a checkout of the repo → `pip install .` (Python 3.12+).
+  - Otherwise → `pipx install findmytakeover`, or the Docker image (mount the
+    config and cloud credential directories read-only).
+  Below, `findmytakeover` means whichever of these you ended up with.
+- **Read-only credentials** already working in the local CLIs. The tool never
+  logs in for the user:
+  - **AWS** — `ViewOnlyAccess` + `SecurityAudit` (or an assumable read-only role)
   - **GCP** — `Viewer` (Application Default Credentials, or a service-account key)
-  - **Azure** — `Reader` (Azure CLI login, or tenant/client/secret)
-  - **Cloudflare** — read-only API token (`CLOUDFLARE_API_TOKEN` env, or a token string)
-  - **Oracle (OCI)** — `read`/`inspect` group (`~/.oci/config` DEFAULT profile, or a config path)
-- Dependencies: `pip3 install .` from the repo root (installs from `pyproject.toml`).
+  - **Azure** — `Reader` (`az login`, or tenant/client/secret)
+  - **Cloudflare** — read-only API token (`CLOUDFLARE_API_TOKEN`)
+  - **Oracle (OCI)** — `read`/`inspect` (`~/.oci/config` DEFAULT profile)
 
 ## Workflow
 
 ### 1. Configure
 
-The tool reads [`findmytakeover.config`](../../findmytakeover.config) (YAML) —
-default path is the repo root, override with `-c`. Enable only the providers the
-user actually has. For each, set `enabled: true` and pick credentials:
+The tool reads a YAML config (`findmytakeover.config` in the repo is the
+annotated example; pass another with `-c`). Enable only the providers the user
+has. For each, set `enabled: true` and pick credentials:
 
-- `credentials: default` — use the local CLI's logged-in creds and auto-discover
-  accounts/projects/subscriptions. Simplest; prefer this.
+- `credentials: default` — the local CLI's session, with accounts / projects /
+  subscriptions auto-discovered. Simplest; prefer it.
 - Otherwise an IAM role name (AWS), a service-account JSON path (GCP), or a
-  tenant/client/secret mapping (Azure) — and list `accounts:` explicitly.
+  tenant/client/secret mapping (Azure), with `accounts:` listed explicitly.
 
-A provider appears under both `dns:` and `infra:` — both must be enabled for the
-dangling check to run (it needs both sides to diff). Use `exclude:` for IP
-ranges/domains that are known-safe and should never be flagged (e.g. SaaS email
-domains, reserved ranges).
+Each provider appears under both `dns:` and `infra:`. A record can only be
+judged against inventory that was collected, so enable `infra` for **every**
+provider that could own a target, not just the one hosting the zone.
 
-Confirm the config with the user before running — wrong account scope is the
-main way this wastes time.
+Government clouds:
+- **AWS GovCloud** — no setting; the partition comes from the profile's region
+  (`us-gov-west-1` / `us-gov-east-1`).
+- **Azure Government** — add `cloud: AzureUSGovernment` to the Azure block.
+
+`exclude:` takes IP ranges (CIDR, v4/v6) and domains. A domain matches itself
+and its subdomains, not substrings.
+
+Confirm the scope (providers, accounts, exclusions) with the user before
+running — wrong account scope is the main source of false positives. When
+showing the config, never echo client secrets, tokens or key paths back.
 
 ### 2. Run
 
 ```bash
-python3 findmytakeover.py -c findmytakeover.config
-# add -d dump.csv to also save the raw DNS + infrastructure inventory
+findmytakeover -c findmytakeover.config --json findings.json
 ```
 
-It prints how many DNS records and infra resources it collected per provider,
-then one line per dangling record:
+- Read `findings.json`, not the console. Each finding has `record`,
+  `record_type`, `target`, `dns_provider`, `account`, `target_owner`,
+  `saas_service`, `dns_status`, `http_status` and `confidence`.
+- `-d dump.csv` saves the raw DNS + inventory that was diffed. Use it when a
+  known-good record shows up.
+- `--verify-http` fetches fingerprinted SaaS subdomains to match the
+  provider's "no such site" page. It sends requests to the user's hosts, so
+  **ask first**. It confirms takeovers DNS alone can't (most SaaS wildcard DNS).
+- `--no-verify-dns` makes no lookups at all, for offline or locked-down runs.
 
-```
-Found dangling DNS record - <name> with value <value> in <cloud> cloud (account/...: <id>)
-```
+### 3. Check completeness first
 
-Use `-d <file>` whenever the user wants to inspect the raw data or when a result
-looks surprising — the dump shows exactly what DNS and infra were compared.
+If `summary.complete` is `false` (console: "WARNING: the scan is incomplete"),
+some DNS or inventory was not read. `collection_errors` names the provider,
+scope and API that failed — usually a missing permission. A missing inventory
+makes live records look dangling, so report the gaps **before** the findings
+and offer to fix and rerun.
 
-### 3. Report
+### 4. Report
 
-Present the dangling records as a table: **Subdomain · Value (target) · Cloud ·
-Account**. Group by cloud. Call out anything sensitive (customer-named
-subdomains, `*-prod` hosts) for manual confirmation before any deletion.
+Rank by `confidence`, highest first:
 
-Frame confidence honestly (see Interpreting results) — a value missing from the
-inventory is a strong signal, not proof, and some classes of record are expected
-to have no backing infra.
+| confidence | Meaning | Treat as |
+|---|---|---|
+| `high` | SaaS target is NXDOMAIN, or serves the provider's unclaimed-site page | Likely claimable now — urgent |
+| `inventory-miss` | Cloud-looking target not in any scanned account | Dangling, unless an unscanned account owns it |
+| `target-nxdomain` | MX / SRV / SPF target doesn't exist | Broken mail/SPF; a takeover only if that domain is registrable (check WHOIS) |
+| `fingerprinted-still-resolving` / `-dns-unknown` / `-unverified` | Known takeover-prone SaaS, not confirmed | Review; suggest `--verify-http` |
+| `unclassified-third-party` | Points outside every known cloud/SaaS | Low; ask the user who owns it |
 
-### 4. Remediate (show, don't run)
+Present a table per tier: **Record · Type · Target · Confidence · DNS
+provider · Account**. Call out customer-named and `*-prod` hosts for manual
+confirmation.
 
-The tool only reports; it does not delete. For each confirmed dangling record,
-show the user the deletion command for their DNS provider (e.g.
-`aws route53 change-resource-record-sets` with a change batch, `gcloud dns
-record-sets delete`, `az network dns record-set ... delete`).
+### 5. Remediate (show, don't run)
 
-DNS deletion is hard to reverse and outward-facing — default to **showing** the
-command and letting the user run it. Only run it yourself if they explicitly say
-so, and never batch-delete customer-named or `*-prod` records without a
-record-by-record confirmation.
+The tool only reports. For each confirmed record:
 
-## Interpreting results — what is NOT a takeover risk
+1. Re-check it now (`dig +short <record> <type>` and, for a CNAME, the
+   target) — it may have been fixed or re-pointed since the scan.
+2. Show the deletion for the DNS provider: `aws route53
+   change-resource-record-sets` (DELETE change batch), `gcloud dns record-sets
+   delete`, `az network dns record-set <type> delete`, Cloudflare `DELETE
+   /zones/{zone_id}/dns_records/{id}`, or `oci dns record rrset delete`.
 
-A record can have no matching infra yet be perfectly fine. Bucket these
-separately as "stale / out of scope," not as takeover risks:
+DNS deletion is outward-facing and hard to reverse — show the command and let
+the user run it. Only run it yourself when explicitly told to, and never
+batch-delete customer-named or `*-prod` records without confirming each one.
+Never delete an apex MX without asking where mail should go instead.
 
-- **Cert validation** — `*.acm-validations.aws`, `*.authorize.certificatemanager.goog`,
-  `_acme-challenge.*`. These point at validation zones / single-use tokens, not
-  service endpoints. Not a takeover vector.
-- **Email auth (DKIM/SPF etc.)** — CNAMEs into live SaaS provider zones
-  (`*.dkim.*`, `*.domainkey.*`, `*.hubspotemail.net`, salesforce/highspot/etc.).
-  Expected to have no infra in *your* accounts.
+### 6. Make it recurring (if asked)
+
+- `--baseline previous.json` marks each finding `new: true/false` and adds
+  `new` / `resolved` to the report; with a baseline, `--fail-on-findings`
+  fails only on new findings. A missing baseline file is treated as empty.
+- `--fail-on-incomplete` exits 2 when the scan had gaps. With both flags,
+  failing findings take precedence (exit 1).
+- `--alert-webhook URL` (repeatable) or `FINDMYTAKEOVER_ALERT_WEBHOOKS`
+  (comma-separated) posts new findings at `--alert-confidence` levels. Slack
+  URLs get Slack formatting, anything else gets JSON. Keep webhook URLs in
+  secrets — never in the config or the repo.
+- `examples/github-actions-daily.yml` wires all of this into a daily GitHub
+  Actions job with OIDC cloud auth, the previous report as baseline, and one
+  GitHub issue per finding. Copy it rather than writing a workflow from
+  scratch.
+
+## Not a takeover risk
+
+Bucket these as "stale / out of scope", not takeover risks:
+
+- **Cert validation** — `*.acm-validations.aws`,
+  `*.authorize.certificatemanager.goog`, `_acme-challenge.*`.
+- **Email auth (DKIM etc.)** — CNAMEs into live SaaS zones (`*.domainkey.*`,
+  `*.dkim.*`, `*.hubspotemail.net`, ...). Expected to have no inventory in the
+  user's accounts.
 - **SOA / apex NS** — out of scope; never delete as part of this.
-  (Child NS *delegations* to a cloud NS pool are checked — see Pitfalls.)
-- **MX / SRV / SPF** — only reported when the target doesn't exist
-  (`confidence: target-nxdomain`). That means broken mail or SPF, and a
-  takeover only if the target's *domain* can be registered: check WHOIS before
-  calling it one. Never delete an apex MX without the user confirming where
-  mail should go instead.
-- **Incomplete scans.** If the run ends with "WARNING: the scan is incomplete"
-  (JSON `summary.complete: false`), some inventory or DNS wasn't read. Fix the
-  listed permissions and rerun before trusting any finding.
-- **Resources in an account you didn't scan.** If a value points at real infra
-  living in an account/project/subscription that wasn't in the config, it shows
-  up as dangling but isn't. Widen the scan before trusting the result — this is
-  the #1 false positive. Add such ranges/domains to `exclude:` once confirmed.
-
-A genuine takeover risk is a record pointing at a real endpoint (ELB, cloud
-host, app) that exists in **none** of the accounts you scanned.
+- **Private / internal records** — records named under `.internal`, `.local`
+  or cluster DNS, or pointing at private/reserved IPs, are filtered out
+  (counted, not reported).
+- **Resources in an account that wasn't scanned** — the #1 false positive.
+  Widen the scan, or add the range/domain to `exclude:` once the user confirms
+  ownership.
 
 ## Pitfalls
 
-- **Incomplete account scope = false positives.** The tool can only match against
-  infra in the accounts it can read. A value owned by an unscanned account looks
-  dangling. Always confirm the config covers every account that could own the
-  targets before reporting.
-- **Both `dns` and `infra` must be enabled** (and for the same providers you care
-  about) or there's nothing to diff — the tool will say so and exit.
-- **Credentials must already work in the CLI.** The tool assumes roles / uses ADC
-  / Azure login; it does not log you in. A permissions error means fix the cloud
-  creds, not the tool.
-- **NS dangling is partially covered** — the tool flags child NS delegations
-  that point at a cloud-provider nameserver pool (awsdns/azure-dns/googledomains)
-  but whose delegated zone no longer exists in any scanned account. Delegations
-  to other DNS providers are out of scope (can't be judged from cloud inventory).
-  The delegated zone is proven "live" from the **infra** side (zone-name rows),
-  so the provider hosting the child zone must have `infra` enabled and scanned —
-  otherwise a live delegation looks dangling.
-- **Matching is on the record value.** A CNAME/A whose value exactly matches a
-  collected infra endpoint is considered live; partial/normalized mismatches
-  (trailing dots, case) are worth spot-checking with `-d` if a known-good record
-  shows up as dangling.
+- **Matching already normalises** trailing dots, case, Route 53 `dualstack.`
+  aliases, IPv6 forms and S3 endpoint hostnames (to the bucket name). If a
+  known-good record still shows up, compare its value with the dump before
+  assuming a bug.
+- **NS delegations** are checked only when they point at a cloud nameserver
+  pool (Route 53, Azure / Azure Gov, Google, Cloudflare, OCI). The child zone
+  is proven live from the **infra** side, so the provider hosting it must have
+  `infra` enabled.
+- **A permissions error is a credentials problem**, not a tool bug: name the
+  missing permission from `collection_errors` and stop there.

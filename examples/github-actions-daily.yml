@@ -1,0 +1,143 @@
+# Daily dangling-DNS scan with alerting, for a repository you own that holds
+# your findmytakeover.config. Copy to .github/workflows/ there.
+#
+# - Cloud access is OIDC: no long-lived keys in GitHub. Give each role/app
+#   read-only access (see the README's Dependencies section).
+# - Yesterday's report is the baseline, so only NEW findings alert.
+# - Each new finding opens a GitHub issue (label: dangling-dns); the issue is
+#   closed when the finding disappears. A scan that couldn't read everything
+#   opens one "scan incomplete" issue instead of failing silently.
+# - Optional chat/webhook alerts sent by findmytakeover itself
+#   (FINDMYTAKEOVER_ALERT_WEBHOOKS secret: Slack incoming webhooks get a Slack
+#   message, any other URL — Teams via Power Automate, a SIEM — gets JSON).
+name: Dangling DNS scan
+
+on:
+  schedule:
+    - cron: "0 6 * * *"   # daily, 06:00 UTC
+  workflow_dispatch:
+
+permissions:
+  id-token: write   # OIDC to the clouds
+  contents: read
+  actions: read     # download the previous run's report
+  issues: write     # alerting
+
+concurrency:
+  group: dangling-dns-scan
+  cancel-in-progress: false
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.14"
+
+      - run: pip install "findmytakeover==3.*"
+
+      # --- Cloud credentials (keep the ones you scan) -----------------------
+      - uses: aws-actions/configure-aws-credentials@v5
+        with:
+          role-to-assume: arn:aws:iam::123456789012:role/findmytakeover-readonly
+          aws-region: us-east-1   # us-gov-west-1 for GovCloud
+      # - uses: azure/login@v2   # federated credential with Reader on each subscription
+      #   with:
+      #     client-id: ${{ vars.AZURE_CLIENT_ID }}
+      #     tenant-id: ${{ vars.AZURE_TENANT_ID }}
+      #     allow-no-subscriptions: true
+      #     environment: AzureUSGovernment   # for Azure Government
+      # - uses: google-github-actions/auth@v2
+      #   with:
+      #     workload_identity_provider: ${{ vars.GCP_WIF_PROVIDER }}
+      #     service_account: ${{ vars.GCP_SERVICE_ACCOUNT }}
+
+      # --- Baseline: the report from the most recent finished run -----------
+      - name: Download previous report
+        run: |
+          for run_id in $(gh run list --workflow "$GITHUB_WORKFLOW" --status completed \
+                            --limit 10 --json databaseId --jq '.[].databaseId'); do
+            if gh run download "$run_id" --name findmytakeover-report --dir baseline 2>/dev/null; then
+              echo "Baseline from run $run_id"
+              exit 0
+            fi
+          done
+          echo "No previous report; this run's findings are all new."
+
+      # --- Scan ----------------------------------------------------------------
+      # Exit 1 = new findings, 2 = incomplete scan. Recorded, not fatal yet, so
+      # the report is still uploaded and alerts still go out.
+      - name: Scan
+        id: scan
+        env:
+          # Space-separated webhook URLs; alerts on new actionable findings and
+          # on an incomplete scan. Empty = no webhook alerts.
+          FINDMYTAKEOVER_ALERT_WEBHOOKS: ${{ secrets.FINDMYTAKEOVER_ALERT_WEBHOOKS }}
+        run: |
+          set +e
+          findmytakeover -c findmytakeover.config \
+            --json findings.json \
+            --baseline baseline/findings.json \
+            --fail-on-findings --fail-on-incomplete
+          echo "status=$?" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/upload-artifact@v4
+        if: always() && hashFiles('findings.json') != ''
+        with:
+          name: findmytakeover-report
+          path: findings.json
+          retention-days: 30
+
+      # --- Alerting: GitHub issues ---------------------------------------------
+      - name: Open and close issues
+        if: always() && hashFiles('findings.json') != ''
+        run: |
+          gh label create dangling-dns --color B60205 \
+            --description "findmytakeover finding" --force >/dev/null
+          open_issues=$(gh issue list --label dangling-dns --state open --limit 1000 --json number,title)
+          issue_for() { jq -r --arg t "$1" '.[] | select(.title == $t) | .number' <<<"$open_issues" | head -1; }
+          title_of() { jq -r '"Dangling DNS: \(.record) -> \(if .record_type then .record_type + " " else "" end)\(.target)"' <<<"$1"; }
+
+          # One issue per new finding (skipped if one is already open).
+          jq -c '.findings[] | select(.new)' findings.json | while read -r f; do
+            title=$(title_of "$f")
+            [ -n "$(issue_for "$title")" ] && continue
+            body=$(jq -r '"| Field | Value |\n|---|---|\n" + (to_entries | map("| \(.key) | \(.value) |") | join("\n"))' <<<"$f")
+            gh issue create --label dangling-dns --title "$title" \
+              --body "$body"$'\n\n'"Found by run $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+          done
+
+          # Close issues for findings that are gone. On an incomplete scan a
+          # finding can look resolved just because it wasn't scanned: keep open.
+          if jq -e '.summary.complete' findings.json >/dev/null; then
+            jq -c '.resolved[]?' findings.json | while read -r f; do
+              number=$(issue_for "$(title_of "$f")")
+              if [ -n "$number" ]; then
+                gh issue close "$number" --comment "No longer found by run $GITHUB_RUN_ID."
+              fi
+            done
+          fi
+
+          # One standing issue while the scan can't read everything.
+          incomplete_title="findmytakeover: scan incomplete"
+          number=$(issue_for "$incomplete_title")
+          if jq -e '.summary.complete | not' findings.json >/dev/null; then
+            errors=$(jq -r '.collection_errors[] | "- \(.provider) \(.what) (\(.scope)): \(.error)"' findings.json | sort -u)
+            if [ -z "$number" ]; then
+              gh issue create --label dangling-dns --title "$incomplete_title" \
+                --body $'Fix these permissions: until then, inventory gaps show up as false positives and DNS gaps hide real findings.\n\n'"$errors"
+            fi
+          elif [ -n "$number" ]; then
+            gh issue close "$number" --comment "Scan complete again in run $GITHUB_RUN_ID."
+          fi
+
+      - name: Fail the run on new findings or an incomplete scan
+        if: always() && steps.scan.outputs.status != '0'
+        env:
+          STATUS: ${{ steps.scan.outputs.status || '1' }}
+        run: exit "$STATUS"

@@ -505,3 +505,165 @@ def test_s3_hostname_regex_is_linear():
     start = time.monotonic()
     assert _S3_HOSTNAME.match("a.s3-" + "--" * 5000 + "!") is None
     assert time.monotonic() - start < 1.0
+
+
+def _finding(record, target, record_type=None, confidence="inventory-miss"):
+    return {"record": record, "record_type": record_type, "target": target,
+            "target_owner": "External", "confidence": confidence}
+
+
+def test_compare_with_baseline():
+    baseline = [
+        _finding("a.example.com", "gone.github.io"),
+        _finding("fixed.example.com", "old.herokuapp.com"),
+        _finding("example.com", "mx.dead.example", "MX"),
+    ]
+    findings = [
+        # Same finding; confidence changing between runs doesn't make it new.
+        _finding("A.example.com.", "gone.github.io.", confidence="high"),
+        _finding("b.example.com", "x.netlify.app"),
+        # Same record and target but a different type is a different finding.
+        _finding("example.com", "mx.dead.example", "TXT"),
+    ]
+    diff = findmytakeover._compare_with_baseline(findings, baseline)
+    assert [f["new"] for f in findings] == [False, True, True]
+    assert [f["record"] for f in diff["new"]] == ["b.example.com", "example.com"]
+    assert [f["record"] for f in diff["resolved"]] == ["fixed.example.com", "example.com"]
+    assert diff["resolved"][1]["record_type"] == "MX"
+
+
+def test_load_baseline():
+    import json as _json
+    import tempfile
+
+    with tempfile.TemporaryDirectory() as d:
+        # First scheduled run: no previous report yet.
+        assert findmytakeover._load_baseline(os.path.join(d, "missing.json")) == []
+
+        good = os.path.join(d, "good.json")
+        with open(good, "w") as fh:
+            _json.dump({"findings": [_finding("a.example.com", "t.example")]}, fh)
+        assert len(findmytakeover._load_baseline(good)) == 1
+
+        # A corrupt baseline must not silently re-alert on everything.
+        for content in ("{not json", '{"summary": {}}'):
+            bad = os.path.join(d, "bad.json")
+            with open(bad, "w") as fh:
+                fh.write(content)
+            try:
+                findmytakeover._load_baseline(bad)
+            except SystemExit as e:
+                assert e.code == 1
+            else:
+                raise AssertionError(f"bad baseline accepted: {content}")
+
+
+def test_exit_codes():
+    from types import SimpleNamespace
+
+    def code(fail_findings, fail_incomplete, findings, incomplete):
+        args = SimpleNamespace(fail_on_findings=fail_findings, fail_on_incomplete=fail_incomplete)
+        return findmytakeover._exit_code(args, findings, incomplete)
+
+    assert code(False, False, 5, True) == 0   # both opt-in
+    assert code(True, False, 5, True) == 1
+    assert code(True, False, 0, True) == 0
+    assert code(False, True, 0, True) == 2
+    assert code(True, True, 3, True) == 1    # findings outrank an incomplete scan
+    assert code(True, True, 0, False) == 0
+
+
+def test_json_report_with_baseline_diff():
+    import json as _json
+    import tempfile
+
+    new = _finding("b.example.com", "x.netlify.app")
+    new["new"] = True
+    diff = {"new": [new], "resolved": [_finding("fixed.example.com", "old.herokuapp.com")]}
+    with tempfile.TemporaryDirectory() as d:
+        path = os.path.join(d, "report.json")
+        findmytakeover._write_json_report(path, [new], 0, (), diff)
+        with open(path) as fh:
+            report = _json.load(fh)
+    assert report["summary"]["new"] == 1
+    assert report["summary"]["resolved"] == 1
+    assert report["resolved"][0]["record"] == "fixed.example.com"
+    assert report["findings"][0]["new"] is True
+
+
+def test_build_alert():
+    findings = [
+        _finding("a.example.com", "gone.github.io", confidence="high"),
+        _finding("b.example.com", "x.herokuapp.com", confidence="fingerprinted-still-resolving"),
+        _finding("c.example.com", "lb.elb.amazonaws.com"),  # inventory-miss
+    ]
+    build = findmytakeover._build_alert
+    default = ",".join(findmytakeover._DEFAULT_ALERT_CONFIDENCE)
+
+    alert = build(findings, default, [])
+    assert [f["record"] for f in alert["findings"]] == ["a.example.com", "c.example.com"]
+    assert alert["complete"] is True
+    assert len(build(findings, "all", [])["findings"]) == 3
+    # Nothing actionable and a complete scan: no alert at all.
+    assert build(findings[1:2], default, []) is None
+    # An incomplete scan alerts even with no findings, with errors grouped.
+    errors = [{"provider": "Amazon Web Services", "scope": s, "what": "rds", "error": "AccessDenied"}
+              for s in ("1/us-east-1", "1/eu-west-1")]
+    alert = build([], default, errors)
+    assert alert["complete"] is False
+    assert alert["collection_errors"] == [
+        {"provider": "Amazon Web Services", "what": "rds", "error": "AccessDenied", "count": 2}
+    ]
+
+
+def test_alert_payload_formats():
+    alert = findmytakeover._build_alert(
+        [_finding(f"h{i}.example.com", "gone.github.io", confidence="high") for i in range(25)],
+        "high",
+        [{"provider": "Cloudflare", "scope": "acct", "what": "Workers", "error": "403"}],
+    )
+    slack = findmytakeover._alert_payload("https://hooks.slack.com/services/T/B/x", alert)
+    assert set(slack) == {"text"}
+    assert "25 dangling DNS record(s)" in slack["text"]
+    assert "…and 5 more" in slack["text"]
+    assert "Scan incomplete" in slack["text"] and "Cloudflare Workers: 403" in slack["text"]
+    # Anything that isn't Slack gets the structured alert, e.g. a Power Automate
+    # flow for Teams or a SIEM collector.
+    generic = findmytakeover._alert_payload("https://siem.example.com/hook", alert)
+    assert generic is alert and len(generic["findings"]) == 25
+    # Lookalike hosts don't get Slack formatting.
+    assert "text" not in findmytakeover._alert_payload("https://hooks.slack.com.evil.example/x", alert)
+
+
+def test_send_alerts_never_leaks_url_or_raises(capsys):
+    class _Response:
+        def __init__(self, ok):
+            self.ok = ok
+
+        def raise_for_status(self):
+            if not self.ok:
+                raise RuntimeError("500 for url https://hooks.slack.com/services/SECRET")
+
+    class _Session:
+        def __init__(self):
+            self.posts = []
+
+        def post(self, url, json, timeout):
+            self.posts.append((url, json))
+            if "down" in url:
+                raise ConnectionError(url)
+            return _Response(ok="fail" not in url)
+
+    session = _Session()
+    alert = findmytakeover._build_alert([_finding("a.example.com", "gone.github.io", confidence="high")], "high", [])
+    findmytakeover._send_alerts(
+        ["https://hooks.slack.com/services/SECRET", "https://down.example/SECRET",
+         "https://fail.example/SECRET"],
+        alert,
+        session=session,
+    )
+    out = capsys.readouterr().out
+    assert len(session.posts) == 3  # one failure doesn't stop the rest
+    assert "Alert sent to hooks.slack.com." in out
+    assert "alert to down.example failed" in out and "alert to fail.example failed" in out
+    assert "SECRET" not in out

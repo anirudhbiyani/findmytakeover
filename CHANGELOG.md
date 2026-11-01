@@ -8,6 +8,26 @@ the project aims to follow [Semantic Versioning](https://semver.org/spec/v2.0.0.
 Entries for 1.x predate this file and were reconstructed from git history, so
 they summarise the shape of each release rather than listing every commit.
 
+## [Unreleased]
+
+### Added
+
+- **`--baseline FILE`** compares a scan with a previous `--json` report: each
+  finding is marked `new`, disappeared findings are listed under `resolved`,
+  and `--fail-on-findings` fails only on new findings.
+- **Built-in alerting**: `--alert-webhook URL` or the
+  `FINDMYTAKEOVER_ALERT_WEBHOOKS` environment variable. Slack incoming webhooks
+  get a Slack message; other URLs get JSON. Alerts on actionable findings
+  (`high`, `inventory-miss`, `target-nxdomain` by default, tunable with
+  `--alert-confidence`) — only new ones with `--baseline` — and on an
+  incomplete scan. Webhook URLs are never printed.
+- **`--fail-on-incomplete`** exits with status 2 when part of the scan couldn't
+  be collected (status 1 for findings still takes precedence).
+- **`examples/github-actions-daily.yml`**: a daily scheduled scan with OIDC
+  cloud credentials, the previous run as baseline, a GitHub issue per new
+  finding (closed when it's resolved), a standing "scan incomplete" issue, and
+  optional webhook alerts.
+
 ## [3.0.0] — 2026-10-31
 
 ### Changed
