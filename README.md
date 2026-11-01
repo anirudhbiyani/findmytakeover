@@ -534,8 +534,9 @@ This tool cannot guarantee 100% protection against subdomain takeovers.
 
 ## Releasing
 
-Releases are tag-free: bump `version` in `pyproject.toml` and merge to `main` to
-publish a GA release to PyPI; open PRs auto-publish `.dev` builds to TestPyPI. See
+Bump `version` in `pyproject.toml` and merge to `main` to publish a GA release
+to PyPI and a tagged GitHub release (wheel and sdist attached); open PRs
+auto-publish `.dev` builds to TestPyPI. See
 [PUBLISHING.md](PUBLISHING.md) for the flow and one-time trusted-publisher setup.
 
 ## Contributing
