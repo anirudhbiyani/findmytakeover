@@ -1,0 +1,122 @@
+# Daily dangling-DNS scan as a Kubernetes CronJob.
+#
+#   kubectl create namespace findmytakeover
+#   kubectl -n findmytakeover create secret generic findmytakeover-alerts \
+#     --from-literal=FINDMYTAKEOVER_ALERT_WEBHOOKS="https://hooks.slack.com/services/..."
+#   kubectl apply -n findmytakeover -f kubernetes-cronjob.yaml
+#
+# Cloud access comes from workload identity; no keys in the cluster. Annotate
+# the ServiceAccount for the clouds you scan and use `credentials: default`:
+#   - AWS on EKS: IRSA (annotation below) or EKS Pod Identity. With no
+#     `accounts`, the role's own account is scanned; to scan several, give a
+#     role name instead of `default` and list the accounts (the IRSA role must
+#     be allowed to assume it in each).
+#   - Azure on AKS: Workload Identity (annotation and pod label below).
+#   - GCP on GKE: Workload Identity (annotation below).
+#
+# Yesterday's report on the volume is today's baseline, so only new findings
+# alert. To keep it in S3 instead of a volume, drop the volume and point
+# --json/--baseline at the same s3://bucket/key (the role needs
+# s3:GetObject and s3:PutObject on it).
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: findmytakeover
+  annotations:
+    eks.amazonaws.com/role-arn: arn:aws:iam::123456789012:role/findmytakeover-readonly
+    # azure.workload.identity/client-id: 00000000-0000-0000-0000-000000000000
+    # iam.gke.io/gcp-service-account: findmytakeover@my-project.iam.gserviceaccount.com
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: findmytakeover-config
+data:
+  findmytakeover.config: |
+    dns:
+      aws:
+        enabled: true
+        credentials: default
+    infra:
+      aws:
+        enabled: true
+        credentials: default
+    exclude:
+      ipaddress: []
+      domains: []
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: findmytakeover-reports
+spec:
+  accessModes: [ReadWriteOnce]
+  resources:
+    requests:
+      storage: 64Mi
+---
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: findmytakeover
+spec:
+  schedule: "0 6 * * *"            # daily, 06:00 in the cluster's time zone
+  concurrencyPolicy: Forbid        # never two scans at once
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      # Exit 1 means "new findings" and 2 "incomplete scan" — results, not
+      # crashes. Retrying would re-run the scan and re-send alerts.
+      backoffLimit: 0
+      activeDeadlineSeconds: 3600  # hard cap on a stuck run
+      template:
+        metadata:
+          labels:
+            app: findmytakeover
+            # azure.workload.identity/use: "true"
+        spec:
+          serviceAccountName: findmytakeover
+          restartPolicy: Never
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 65532
+            fsGroup: 65532           # lets the non-root user write the volume
+            seccompProfile:
+              type: RuntimeDefault
+          containers:
+            - name: findmytakeover
+              image: ghcr.io/anirudhbiyani/findmytakeover:3.2.0
+              args:
+                - --config-file=/config/findmytakeover.config
+                # The baseline is read before the scan and the report written
+                # after it, so one file serves as both.
+                - --baseline=/reports/findings.json
+                - --json=/reports/findings.json
+                - --fail-on-findings
+                - --fail-on-incomplete
+              envFrom:
+                - secretRef:
+                    name: findmytakeover-alerts
+                    optional: true
+              resources:
+                requests: {cpu: 250m, memory: 512Mi}
+                limits: {memory: 1Gi}
+              securityContext:
+                allowPrivilegeEscalation: false
+                readOnlyRootFilesystem: true
+                capabilities:
+                  drop: [ALL]
+              volumeMounts:
+                - {name: config, mountPath: /config, readOnly: true}
+                - {name: reports, mountPath: /reports}
+                - {name: tmp, mountPath: /tmp}
+          volumes:
+            - name: config
+              configMap:
+                name: findmytakeover-config
+            - name: reports
+              persistentVolumeClaim:
+                claimName: findmytakeover-reports
+            - name: tmp
+              emptyDir: {}

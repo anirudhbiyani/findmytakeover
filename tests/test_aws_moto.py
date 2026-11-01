@@ -34,6 +34,10 @@ def mocked_aws(monkeypatch):
     }.items():
         monkeypatch.setenv(key, value)
     monkeypatch.delenv("AWS_PROFILE", raising=False)
+    # No CLI profiles, like a container: only the environment's credentials.
+    monkeypatch.setenv("AWS_CONFIG_FILE", os.devnull)
+    monkeypatch.setenv("AWS_SHARED_CREDENTIALS_FILE", os.devnull)
+    monkeypatch.setattr(aws, "_AMBIENT_ACCOUNTS", set())
     # Clients, sessions and credentials cached by an earlier test belong to
     # a different mock.
     monkeypatch.setattr(aws, "_CLIENTS", {})
@@ -93,3 +97,43 @@ def test_aws_scan_end_to_end(mocked_aws):
     assert found["old.example.com"]["confidence"] == "inventory-miss"
     # The assumed-role path ran (moto's STS), with refreshable credentials.
     assert aws._role_credentials(ACCOUNT, "findmytakeover-audit").refresh_needed() is False
+
+
+def test_default_credentials_without_profiles_scan_the_ambient_account(mocked_aws):
+    """A container (IRSA, ECS task role, GitHub OIDC) has credentials but no
+    ~/.aws profiles; credentials: default must still scan that account."""
+    _build_environment()
+    providers = {"aws": {"enabled": True, "credentials": "default", "accounts": []}}
+
+    result = findmytakeover.scan(providers, providers, verify_dns=False)
+
+    assert {f["record"] for f in result["findings"]} == {"old.example.com", "released.example.com"}
+    assert {f["account"] for f in result["findings"]} == {ACCOUNT}
+    # (moto lacks a few APIs, which show up as gaps; credentials aren't one.)
+    assert not [e for e in result["collection_errors"] if "credentials" in e["what"]]
+
+
+def test_s3_config_baseline_and_report(mocked_aws, tmp_path):
+    s3 = boto3.client("s3", region_name=REGION)
+    s3.create_bucket(Bucket="scans")
+    s3.put_object(Bucket="scans", Key="findmytakeover.config", Body=b"""
+dns:
+  aws: {enabled: true, credentials: default}
+infra:
+  aws: {enabled: true, credentials: default}
+""")
+
+    dns_config, infra_config, _ = findmytakeover.read_config("s3://scans/findmytakeover.config")
+    assert dns_config["aws"]["credentials"] == "default"
+
+    # First scheduled run: no baseline object yet.
+    assert findmytakeover._load_baseline("s3://scans/findings.json") == []
+
+    findings = [{"record": "a.example.com", "record_type": None, "target": "gone.github.io",
+                 "target_owner": "External", "confidence": "high"}]
+    findmytakeover._write_json_report("s3://scans/findings.json", findings, 0)
+    assert findmytakeover._load_baseline("s3://scans/findings.json") == findings
+
+    # A bucket that doesn't exist is an error, not an empty baseline.
+    with pytest.raises(OSError):
+        findmytakeover._read_text("s3://no-such-bucket/findings.json")

@@ -63,13 +63,55 @@ CLI_PROMPT = r"""
 """
 
 
-def read_config(config_path):
-    """Read and validate the configuration file."""
+def _read_text(path):
+    """Contents of a local file or an s3://bucket/key object. A missing object
+    raises FileNotFoundError and any other S3 failure OSError, like a file."""
+    if not str(path).startswith("s3://"):
+        with open(path) as handle:
+            return handle.read()
+    import boto3
+    from botocore.exceptions import BotoCoreError, ClientError
+
+    location = urlparse(path)
     try:
-        with open(config_path, "rt") as f:
-            config = yaml.safe_load(f)
+        response = boto3.client("s3").get_object(Bucket=location.netloc, Key=location.path.lstrip("/"))
+        return response["Body"].read().decode()
+    except ClientError as e:
+        if e.response["Error"]["Code"] in ("NoSuchKey", "404"):
+            raise FileNotFoundError(path) from e
+        raise OSError(f"{path}: {e}") from e
+    except BotoCoreError as e:
+        raise OSError(f"{path}: {e}") from e
+
+
+def _write_text(path, text):
+    """Write a local file or an s3://bucket/key object; failures raise OSError."""
+    if not str(path).startswith("s3://"):
+        with open(path, "w") as handle:
+            handle.write(text)
+        return
+    import boto3
+    from botocore.exceptions import BotoCoreError, ClientError
+
+    location = urlparse(path)
+    try:
+        boto3.client("s3").put_object(
+            Bucket=location.netloc, Key=location.path.lstrip("/"),
+            Body=text.encode(), ContentType="application/json",
+        )
+    except (BotoCoreError, ClientError) as e:
+        raise OSError(f"{path}: {e}") from e
+
+
+def read_config(config_path):
+    """Read and validate the configuration file (a path or s3://bucket/key)."""
+    try:
+        config = yaml.safe_load(_read_text(config_path))
     except FileNotFoundError:
         click.echo(f"Configuration file not found: {config_path}")
+        sys.exit(1)
+    except OSError as e:
+        click.echo(f"Could not read the configuration file: {e}")
         sys.exit(1)
     except yaml.YAMLError:
         click.echo("Invalid YAML file!")
@@ -767,7 +809,7 @@ def main():
         "-c", "--config-file",
         default=os.path.join(os.getcwd(), "findmytakeover.config"),
         type=str,
-        help="Path to the configuration file",
+        help="Path to the configuration file, or s3://bucket/key",
     )
     parser.add_argument(
         "-d", "--dump-file",
@@ -791,8 +833,8 @@ def main():
         dest="json_file",
         type=str,
         help=(
-            "Write findings as JSON to this path, for feeding a SIEM, ticketing "
-            "system or dashboard. Use '-' for stdout."
+            "Write findings as JSON to this path (or s3://bucket/key), for "
+            "feeding a SIEM, ticketing system or dashboard. Use '-' for stdout."
         ),
     )
     parser.add_argument(
@@ -818,7 +860,8 @@ def main():
         "--baseline",
         metavar="JSON_FILE",
         help=(
-            "A previous --json report. Findings are marked new or already known, "
+            "A previous --json report (a path or s3://bucket/key; it may be the "
+            "same location as --json). Findings are marked new or already known, "
             "fixed ones are listed as resolved, and --fail-on-findings only fails "
             "on new findings. A missing file counts as an empty baseline (first run)."
         ),
@@ -1038,8 +1081,7 @@ def _load_baseline(path):
     baseline (the first scheduled run); an unreadable one is an error, because
     silently treating it as empty would re-alert on everything."""
     try:
-        with open(path) as handle:
-            report = json.load(handle)
+        report = json.loads(_read_text(path))
     except FileNotFoundError:
         click.echo(f"Baseline {path} not found; treating every finding as new.")
         return []
@@ -1104,8 +1146,7 @@ def _write_json_report(path, findings, hidden_internal, collection_errors=(), di
         return
 
     try:
-        with open(path, "w") as handle:
-            json.dump(report, handle, indent=2)
+        _write_text(path, json.dumps(report, indent=2))
     except OSError as e:
         click.echo(f"Could not write JSON report to {path}: {e}")
         sys.exit(1)
@@ -1352,14 +1393,13 @@ def _terraform_dangling(plan, live_records=()):
 def _terraform_guard(args):
     """--terraform-plan: fail (exit 1) if applying the plan leaves DNS dangling."""
     try:
-        with open(args.terraform_plan) as handle:
-            plan = json.load(handle)
+        plan = json.loads(_read_text(args.terraform_plan))
     except (OSError, ValueError) as e:
         click.echo(f"Could not read Terraform plan {args.terraform_plan}: {e}")
         return 1
 
     live = []
-    if os.path.exists(args.config_file):
+    if args.config_file.startswith("s3://") or os.path.exists(args.config_file):
         click.echo(f"Reading live DNS using {args.config_file}")
         dns_config, _, _ = read_config(args.config_file)
         live = _collect_dns_records(dns_config)
@@ -1381,8 +1421,7 @@ def _terraform_guard(args):
         if args.json_file == "-":
             click.echo(json.dumps(payload, indent=2))
         else:
-            with open(args.json_file, "w") as handle:
-                json.dump(payload, handle, indent=2)
+            _write_text(args.json_file, json.dumps(payload, indent=2))
     return 1 if findings else 0
 
 

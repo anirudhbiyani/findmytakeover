@@ -1,0 +1,17 @@
+{
+  "Arn": "arn:aws:ecs:us-east-1:123456789012:cluster/default",
+  "RoleArn": "arn:aws:iam::123456789012:role/findmytakeover-scheduler",
+  "EcsParameters": {
+    "TaskDefinitionArn": "arn:aws:ecs:us-east-1:123456789012:task-definition/findmytakeover",
+    "LaunchType": "FARGATE",
+    "TaskCount": 1,
+    "NetworkConfiguration": {
+      "awsvpcConfiguration": {
+        "Subnets": ["subnet-0123456789abcdef0"],
+        "SecurityGroups": ["sg-0123456789abcdef0"],
+        "AssignPublicIp": "ENABLED"
+      }
+    }
+  },
+  "RetryPolicy": { "MaximumRetryAttempts": 0 }
+}

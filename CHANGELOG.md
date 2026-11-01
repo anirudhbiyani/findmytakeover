@@ -8,6 +8,28 @@ the project aims to follow [Semantic Versioning](https://semver.org/spec/v2.0.0.
 Entries for 1.x predate this file and were reconstructed from git history, so
 they summarise the shape of each release rather than listing every commit.
 
+## [3.2.0] — 2026-11-01
+
+### Added
+
+- **Container images on GHCR**: `ghcr.io/anirudhbiyani/findmytakeover:<version>`
+  and `:latest`, for amd64 and arm64, published for each new version on `main`.
+- **`s3://bucket/key`** for `--config-file`, `--baseline` and `--json` (and
+  `--terraform-plan`), so a scheduled task needs no volume. A missing baseline
+  object is the first run; any other S3 error fails the run.
+- **Kubernetes and ECS examples**: `examples/kubernetes-cronjob.yaml` (CronJob
+  with workload identity, ConfigMap and baseline volume) and
+  `examples/ecs-task-definition.json` + `examples/ecs-schedule-target.json`
+  (Fargate task run by EventBridge Scheduler, everything in S3).
+
+### Fixed
+
+- AWS with `credentials: default` and no `~/.aws` profiles — a container or CI
+  job using IRSA, EKS Pod Identity, an ECS task role or GitHub OIDC — scanned
+  nothing and still reported a complete, clean scan. It now scans the account
+  the ambient credentials belong to, and records a collection error when there
+  are no usable credentials.
+
 ## [3.1.0] — 2026-11-01
 
 ### Added
