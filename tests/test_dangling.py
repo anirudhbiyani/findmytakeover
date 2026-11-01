@@ -846,3 +846,28 @@ def test_azure_collectors_are_subscription_wide_and_isolated():
     collector.COLLECTION_ERRORS.clear()
     # An unregistered provider has no resources; a denied one is a gap.
     assert errors == ["sql"]
+
+
+def test_aws_default_credentials_with_nothing_to_use_is_a_gap(monkeypatch):
+    from botocore.exceptions import NoCredentialsError
+
+    import collector
+    from collector import aws
+
+    class _NoCredentials:
+        available_profiles = []
+        region_name = None
+
+        def client(self, *args, **kwargs):
+            class _Sts:
+                def get_caller_identity(self):
+                    raise NoCredentialsError()
+            return _Sts()
+
+    monkeypatch.setattr(aws.boto3, "Session", _NoCredentials)
+    collector.COLLECTION_ERRORS.clear()
+    assert aws._resolve_accounts([], True) == []
+    errors = list(collector.COLLECTION_ERRORS)
+    collector.COLLECTION_ERRORS.clear()
+    # Reported, so the scan is marked incomplete instead of looking clean.
+    assert [e["what"] for e in errors] == ["credentials (nothing scanned)"]

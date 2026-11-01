@@ -19,16 +19,24 @@ pip install findmytakeover
 findmytakeover --help
 ```
 
-### With Docker
-The image (Python 3.14 on Alpine) runs as a non-root user; config and cloud credentials are supplied at run
-time via volume mounts:
+### From a GitHub release
+Every version's wheel is attached to its [release](https://github.com/anirudhbiyani/findmytakeover/releases):
 ```
-docker build -t findmytakeover .
+pip install https://github.com/anirudhbiyani/findmytakeover/releases/download/v3.2.0/findmytakeover-3.2.0-py3-none-any.whl
+```
+
+### With Docker
+The image (Python 3.14 on Alpine, amd64 and arm64) is published to GHCR for
+every version and runs as a non-root user; config and cloud credentials are
+supplied at run time via volume mounts:
+```
 docker run --rm \
   -v "$PWD/findmytakeover.config:/app/findmytakeover.config" \
   -v "$HOME/.aws:/home/nonroot/.aws:ro" \
-  findmytakeover
+  ghcr.io/anirudhbiyani/findmytakeover:latest
 ```
+Pin a version (`:3.2.0`) for scheduled jobs. `docker build -t findmytakeover .`
+builds it from source.
 
 ### From source
 ```
@@ -210,6 +218,48 @@ ready-to-copy GitHub Actions workflow for a repository that holds your config:
 The scan needs your cloud credentials, so it belongs in your own repository,
 not this one.
 
+### Running on Kubernetes or ECS
+
+The image runs one scan and exits, so it fits a Kubernetes CronJob or a
+scheduled ECS task. Both examples keep yesterday's report as the baseline (only
+new findings alert) and send alerts from `FINDMYTAKEOVER_ALERT_WEBHOOKS`.
+
+**Credentials.** Use the platform's workload identity with `credentials:
+default`: IRSA or EKS Pod Identity, an ECS task role, AKS or GKE Workload
+Identity. With no `accounts` and no `~/.aws` profiles (the usual case in a
+container), AWS scans the account the ambient credentials belong to. To scan
+several accounts, give a role name instead of `default` and list them; the
+workload's role must be allowed to assume it in each.
+
+**Config, baseline and report in S3.** `--config-file`, `--baseline` and
+`--json` accept `s3://bucket/key`. The baseline is read before the scan and the
+report written after it, so both can be the same object.
+
+**Kubernetes** — [`examples/kubernetes-cronjob.yaml`](examples/kubernetes-cronjob.yaml):
+a ServiceAccount for workload identity, the config as a ConfigMap, and a small
+volume for the baseline. `backoffLimit: 0` matters: exit 1 (findings) and 2
+(incomplete) are results, and a retry would scan and alert again.
+
+**ECS on Fargate** — [`examples/ecs-task-definition.json`](examples/ecs-task-definition.json)
+and [`examples/ecs-schedule-target.json`](examples/ecs-schedule-target.json):
+```
+aws ecs register-task-definition --cli-input-json file://examples/ecs-task-definition.json
+aws scheduler create-schedule --name findmytakeover-daily \
+  --schedule-expression "cron(0 6 * * ? *)" --flexible-time-window Mode=OFF \
+  --target file://examples/ecs-schedule-target.json
+```
+Roles it needs:
+- **Task role** — read access to what you scan (`ViewOnlyAccess` +
+  `SecurityAudit`), `s3:GetObject`/`s3:PutObject` on the bucket, and
+  `securityhub:BatchImportFindings` if you add `--security-hub`.
+- **Execution role** — `AmazonECSTaskExecutionRolePolicy`, `ssm:GetParameters`
+  for the webhook parameter, and `logs:CreateLogGroup`.
+- **Scheduler role** — `ecs:RunTask` on the task definition and `iam:PassRole`
+  for the two roles above.
+
+Nothing watches an ECS task's exit code, so rely on the alerts (or
+`--security-hub`) rather than the exit status.
+
 ### Alerts
 
 findmytakeover can post alerts itself. Give it one or more webhook URLs,
@@ -257,7 +307,7 @@ should be fixed rather than trusted.
 ```json
 {
   "tool": "findmytakeover",
-  "version": "3.1.0",
+  "version": "3.2.0",
   "summary": {
     "total": 12,
     "high_confidence": 2,

@@ -205,8 +205,33 @@ def _resolve_accounts(accounts, use_default):
         return accounts
 
     profiles = boto3.Session().available_profiles
-    click.echo(f"Auto-discovered {len(profiles)} AWS profile(s) from ~/.aws/config: {', '.join(profiles)}")
-    return profiles
+    if profiles:
+        click.echo(f"Auto-discovered {len(profiles)} AWS profile(s) from ~/.aws/config: {', '.join(profiles)}")
+        return profiles
+
+    # No CLI profiles: a container or CI job with credentials from the
+    # environment (IRSA, EKS Pod Identity, an ECS task role, GitHub OIDC).
+    # Scan the account those credentials belong to.
+    try:
+        account = boto3.Session().client(
+            "sts", config=_CLIENT_CONFIG, region_name=boto3.Session().region_name or _DEFAULT_REGION
+        ).get_caller_identity()["Account"]
+    except _COLLECTION_ERRORS as e:
+        note_error(_PROVIDER, "(no profiles)", "credentials (nothing scanned)", e)
+        return []
+    click.echo(f"No AWS profiles found; using the ambient credentials for account {account}")
+    _AMBIENT_ACCOUNTS.add(account)
+    return [account]
+
+
+# Accounts scanned with ambient credentials rather than a named profile.
+_AMBIENT_ACCOUNTS = set()
+
+
+def _profile(aws_account):
+    """The CLI profile for an account under default credentials (None for the
+    ambient credentials)."""
+    return None if aws_account in _AMBIENT_ACCOUNTS else aws_account
 
 
 @lru_cache(maxsize=None)
@@ -214,7 +239,7 @@ def _home_region(iamrole, aws_account):
     """The region the account's credentials live in: the profile's region with
     default credentials, else the environment's. GovCloud users set a
     us-gov-* region here, and everything partition-specific follows from it."""
-    profile = aws_account if _is_default_credentials(iamrole) else None
+    profile = _profile(aws_account) if _is_default_credentials(iamrole) else None
     return boto3.Session(profile_name=profile).region_name or _DEFAULT_REGION
 
 
@@ -266,7 +291,7 @@ def _session(iamrole, aws_account):
     key = (iamrole, aws_account)
     if key not in sessions:
         if _is_default_credentials(iamrole):
-            sessions[key] = boto3.Session(profile_name=aws_account)
+            sessions[key] = boto3.Session(profile_name=_profile(aws_account))
         else:
             core = botocore.session.get_session()
             # botocore has no public setter for credentials on a session;

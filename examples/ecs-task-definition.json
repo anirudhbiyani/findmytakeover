@@ -1,0 +1,45 @@
+{
+  "family": "findmytakeover",
+  "requiresCompatibilities": ["FARGATE"],
+  "networkMode": "awsvpc",
+  "cpu": "512",
+  "memory": "1024",
+  "runtimePlatform": {
+    "cpuArchitecture": "ARM64",
+    "operatingSystemFamily": "LINUX"
+  },
+  "taskRoleArn": "arn:aws:iam::123456789012:role/findmytakeover-task",
+  "executionRoleArn": "arn:aws:iam::123456789012:role/findmytakeover-execution",
+  "containerDefinitions": [
+    {
+      "name": "findmytakeover",
+      "image": "ghcr.io/anirudhbiyani/findmytakeover:3.2.0",
+      "essential": true,
+      "command": [
+        "--config-file=s3://my-findmytakeover-bucket/findmytakeover.config",
+        "--baseline=s3://my-findmytakeover-bucket/findings.json",
+        "--json=s3://my-findmytakeover-bucket/findings.json",
+        "--fail-on-findings",
+        "--fail-on-incomplete"
+      ],
+      "secrets": [
+        {
+          "name": "FINDMYTAKEOVER_ALERT_WEBHOOKS",
+          "valueFrom": "arn:aws:ssm:us-east-1:123456789012:parameter/findmytakeover/alert-webhooks"
+        }
+      ],
+      "readonlyRootFilesystem": true,
+      "mountPoints": [{ "sourceVolume": "tmp", "containerPath": "/tmp" }],
+      "logConfiguration": {
+        "logDriver": "awslogs",
+        "options": {
+          "awslogs-group": "/ecs/findmytakeover",
+          "awslogs-region": "us-east-1",
+          "awslogs-stream-prefix": "scan",
+          "awslogs-create-group": "true"
+        }
+      }
+    }
+  ],
+  "volumes": [{ "name": "tmp" }]
+}
