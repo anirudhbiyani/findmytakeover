@@ -8,7 +8,7 @@ the project aims to follow [Semantic Versioning](https://semver.org/spec/v2.0.0.
 Entries for 1.x predate this file and were reconstructed from git history, so
 they summarise the shape of each release rather than listing every commit.
 
-## [Unreleased]
+## [3.1.0] — 2026-11-01
 
 ### Added
 

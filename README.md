@@ -257,7 +257,7 @@ should be fixed rather than trusted.
 ```json
 {
   "tool": "findmytakeover",
-  "version": "3.0.0",
+  "version": "3.1.0",
   "summary": {
     "total": 12,
     "high_confidence": 2,
