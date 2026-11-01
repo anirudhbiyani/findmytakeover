@@ -257,7 +257,7 @@ should be fixed rather than trusted.
 ```json
 {
   "tool": "findmytakeover",
-  "version": "3.0.0",
+  "version": "3.1.0",
   "summary": {
     "total": 12,
     "high_confidence": 2,
@@ -534,8 +534,9 @@ This tool cannot guarantee 100% protection against subdomain takeovers.
 
 ## Releasing
 
-Releases are tag-free: bump `version` in `pyproject.toml` and merge to `main` to
-publish a GA release to PyPI; open PRs auto-publish `.dev` builds to TestPyPI. See
+Bump `version` in `pyproject.toml` and merge to `main` to publish a GA release
+to PyPI and a tagged GitHub release (wheel and sdist attached); open PRs
+auto-publish `.dev` builds to TestPyPI. See
 [PUBLISHING.md](PUBLISHING.md) for the flow and one-time trusted-publisher setup.
 
 ## Contributing
