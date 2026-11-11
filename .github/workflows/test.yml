@@ -48,6 +48,30 @@ jobs:
           python -m pip install pytest "moto[apigateway,apigatewayv2,ec2,elb,elbv2,route53,s3,sts]"
           python -m pytest tests/ -v
 
+  # The job above resolves the pyproject ranges fresh; this one installs the
+  # exact set the container image ships. Dependabot edits lock lines without
+  # re-resolving, so a bump another package's pin rules out fails here.
+  lock:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.14"   # the Dockerfile's
+
+      - name: Install the lock the way the Dockerfile does
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements-lock.txt
+          python -m pip install --no-deps .
+          python -m pip check
+
+      - name: Run tests
+        run: |
+          python -m pip install pytest "moto[apigateway,apigatewayv2,ec2,elb,elbv2,route53,s3,sts]"
+          python -m pytest tests/ -q
+
   lint:
     runs-on: ubuntu-latest
     steps:
