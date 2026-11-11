@@ -8,7 +8,7 @@ aiosignal==1.4.0
     # via aiohttp
 annotated-types==0.8.0
     # via pydantic
-anyio==4.15.1
+anyio==4.16.0
     # via
     #   cloudflare
     #   httpx
@@ -84,9 +84,9 @@ azure-mgmt-trafficmanager==2.0.0
     # via findmytakeover (pyproject.toml)
 azure-mgmt-web==11.0.1
     # via findmytakeover (pyproject.toml)
-boto3==1.43.123
+boto3==1.43.125
     # via findmytakeover (pyproject.toml)
-botocore==1.43.123
+botocore==1.43.125
     # via
     #   boto3
     #   s3transfer
@@ -105,7 +105,7 @@ circuitbreaker==2.1.3
     # via oci
 click==8.5.0
     # via findmytakeover (pyproject.toml)
-cloudflare==5.9.0
+cloudflare==5.10.0
     # via findmytakeover (pyproject.toml)
 crc32c==2.8
     # via oci
@@ -119,13 +119,13 @@ cryptography==50.0.2
     #   pyopenssl
 distro==1.9.0
     # via cloudflare
-dnspython==2.9.1
+dnspython==2.9.2
     # via findmytakeover (pyproject.toml)
 frozenlist==1.8.0
     # via
     #   aiohttp
     #   aiosignal
-google-api-core==2.43.2
+google-api-core==2.44.0
     # via
     #   google-cloud-appengine-admin
     #   google-cloud-artifact-registry
@@ -136,7 +136,7 @@ google-api-core==2.43.2
     #   google-cloud-resource-manager
     #   google-cloud-run
     #   google-cloud-storage
-google-auth==2.62.0
+google-auth==2.62.1
     # via
     #   findmytakeover (pyproject.toml)
     #   google-api-core
@@ -153,7 +153,7 @@ google-cloud-appengine-admin==1.19.0
     # via findmytakeover (pyproject.toml)
 google-cloud-artifact-registry==1.23.0
     # via findmytakeover (pyproject.toml)
-google-cloud-compute==1.56.0
+google-cloud-compute==1.57.0
     # via findmytakeover (pyproject.toml)
 google-cloud-container==2.67.0
     # via findmytakeover (pyproject.toml)
@@ -254,11 +254,11 @@ numpy==2.5.4
     # via pandas
 oauthlib==4.0.1
     # via requests-oauthlib
-oci==2.189.0
+oci==2.190.0
     # via findmytakeover (pyproject.toml)
 opentelemetry-api==1.45.2
     # via google-api-core
-pandas==3.1.0
+pandas==3.1.1
     # via findmytakeover (pyproject.toml)
 propcache==0.5.4
     # via
@@ -294,9 +294,9 @@ pyasn1-modules==0.4.2
     # via google-auth
 pycparser==3.12 ; implementation_name != 'PyPy' and platform_python_implementation != 'PyPy'
     # via cffi
-pydantic==2.14.2
+pydantic==2.14.3
     # via cloudflare
-pydantic-core==2.50.2
+pydantic-core==2.50.4
     # via pydantic
 pyjwt==2.15.1
     # via
@@ -361,7 +361,7 @@ typing-extensions==4.16.0
     #   pydantic-core
     #   pyopenssl
     #   typing-inspection
-typing-inspection==0.4.4
+typing-inspection==0.4.5
     # via pydantic
 tzdata==2026.6 ; sys_platform == 'emscripten' or sys_platform == 'win32'
     # via pandas
